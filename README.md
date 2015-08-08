@@ -18,3 +18,6 @@ Clone this repository by doing
     git clone https://github.com/1995parham/ELBoT.git && cd ELBoT
     
 ### Running ELBot ###
+````
+    /path/to/tg-bin/ -Z bots.py
+````
