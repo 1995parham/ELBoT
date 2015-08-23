@@ -38,23 +38,11 @@ class MainBot:
         else:  # Group message
             peer = message.dest
         for module in MainBot.modules:
-            if message.text is not None and message.text.startswith("!" + module.bot_name):
+            if message.text is not None and message.text.startswith("/" + module.bot_name):
                 query = message.text[1 + len(module.bot_name):]
                 query = query.lstrip()
                 query = query.rstrip()
                 module().run_query(query, message, peer)
-
-    @staticmethod
-    def on_user_update(peer, what_changed):
-        """
-        updated info about user. peer is a object representing the user.
-        :param peer: tgl.Peer
-        :param what_changed: array of strings
-        :return:
-        """
-        if peer.username == 'mrma95':
-            if peer.user_status['online']:
-                peer.send_msg("Salute !, You went online.... at {}".format(peer.user_status['when']))
 
 
 import bots
@@ -62,4 +50,3 @@ import bots
 # Set callbacks
 tgl.set_on_msg_receive(MainBot.on_msg_receive)
 tgl.set_on_our_id(MainBot.on_our_id)
-tgl.set_on_user_update(MainBot.on_user_update)
