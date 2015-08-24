@@ -15,7 +15,7 @@ import tgl
 
 class FTPBot(bots.abstract_bot.AbstractBot):
     bot_name = 'ftp'
-    authorize_phones = ['989124493153']
+    authorize_users = ['parham_alvani']
 
     def __init__(self):
         self.msg = None
@@ -24,7 +24,7 @@ class FTPBot(bots.abstract_bot.AbstractBot):
     def run_query(self, query: str, msg: tgl.Msg, peer: tgl.Peer):
         self.msg = msg
         self.peer = peer
-        if self.msg.src.phone in FTPBot.authorize_phones:
+        if self.msg.src.username in FTPBot.authorize_users:
             command = query.split(' ')[0]
             try:
                 method = getattr(self, 'do_' + command)
@@ -35,10 +35,10 @@ class FTPBot(bots.abstract_bot.AbstractBot):
                 return
             method(query[len(command):].strip())
         else:
-            self.peer.send_msg("You have not permission on FTP server", reply=self.msg.id)
+            self.peer.send_msg("You don not have permission on FTP server", reply=self.msg.id)
 
     def do_ls(self, query: str):
-        path = query.split(' ')[0]
+        path = query.lstrip()
         if not os.path.exists(path):
             self.peer.send_msg("Error: Path not found [{}]".format(path), reply=self.msg.id)
             return
@@ -51,7 +51,7 @@ class FTPBot(bots.abstract_bot.AbstractBot):
         self.peer.send_msg(reply, reply=self.msg.id)
 
     def do_get(self, query: str):
-        path = query.split(' ')[0]
+        path = query.lstrip()
         if not os.path.exists(path):
             self.peer.send_msg("Error: Path not found [{}]".format(path), reply=self.msg.id)
             return
