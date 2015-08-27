@@ -44,3 +44,24 @@ class BotFather:
         if reply_markup is not None:
             params['reply_markup'] = reply_markup
         requests.get(url=self.base_url + 'sendMessage', params=params)
+
+    def get_updates(self, offset: int=0, limit: int=0, timeout: int=0):
+        """
+        Use this method to receive incoming updates using long polling. An Array of Update objects is returned.
+        :param offset: Identifier of the first update to be returned.
+                       Must be greater by one than the highest among the identifiers of previously received updates.
+                       By default, updates starting with the earliest unconfirmed update are returned.
+                       An update is considered confirmed as soon as getUpdates is called with an offset higher than
+                       its update_id.
+        :param limit: Limits the number of updates to be retrieved. Values between 1—100 are accepted. Defaults to 100
+        :param timeout: Timeout in seconds for long polling. Defaults to 0, i.e. usual short polling
+        :return: []
+        """
+        params = {}
+        if offset != 0:
+            params['offset'] = offset
+        if limit != 0:
+            params['limit'] = limit
+        if timeout != 0:
+            params['timeout'] = timeout
+        response = requests.get(url=self.base_url + 'getUpdates', params=params)
