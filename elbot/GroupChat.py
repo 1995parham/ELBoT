@@ -27,7 +27,7 @@ class GroupChatJSONEncoder(json.JSONEncoder):
     def default(self, obj: GroupChat):
         if obj is GroupChat:
             return {
-                'id': obj.group_id,
+                'id': str(obj.group_id),
                 'title': obj.title
             }
         else:
@@ -37,4 +37,4 @@ class GroupChatJSONEncoder(json.JSONEncoder):
 class GroupChatDictDecoder:
     @staticmethod
     def decode(obj: dict) -> GroupChat:
-        return GroupChat(group_id=obj['id'], title=obj['title'])
+        return GroupChat(group_id=int(obj['id']), title=obj['title'])
