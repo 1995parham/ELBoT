@@ -9,7 +9,7 @@
 __author__ = 'Parham Alvani'
 
 from elbot import BotFather
-from bots.python_bot import PythonBot
+from bots.PythonBot import PythonBot
 
 elbot = BotFather.BotFather('128827058:AAHss2FTdF7zKgFudkF7cUlOFbqFC66QO00', [PythonBot()])
 elbot.start()
