@@ -21,10 +21,24 @@ class Message:
     :type src: User.User
     :type date: datetime.datetime
     :type chat: User.User or GroupChat.GroupChat
+    :type text: str
     """
 
-    def __init__(self, message_id, src, date, chat):
+    def __init__(self, message_id, src, date, chat, text=''):
         self.message_id = message_id
         self.src = src
         self.date = date
+        self.text = text
         self.chat = chat
+
+
+class MessageDictDecoder:
+    @staticmethod
+    def decode(obj: dict) -> Message:
+        text = obj.get('text', '')
+        if obj['chat'].get('username', None):
+            chat = User.UserDictDecoder.decode(obj['chat'])
+        else:
+            chat = GroupChat.GroupChatDictDecoder.decode(obj['chat'])
+        return Message(message_id=int(obj['message_id']), src=User.UserDictDecoder.decode(obj['from']),
+                       date=datetime.datetime.fromtimestamp(obj['date']), chat=chat, text=text)

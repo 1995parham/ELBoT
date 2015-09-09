@@ -9,15 +9,16 @@
 __author__ = 'Parham Alvani'
 
 from math import *
-import bots.abstract_bot
-import tgl
+from elbot.AbstractBot import AbstractBot
+from elbot.Message import Message
+from elbot.BotFather import BotFather
 
 
-class PythonBot(bots.abstract_bot.AbstractBot):
+class PythonBot(AbstractBot):
     bot_name = 'python'
 
-    def run_query(self, query: str, msg: tgl.Msg, peer: tgl.Peer):
-        peer.send_msg(str(PythonBot.interpreter(query)), reply=msg.id)
+    def run_query(self, message: Message, father: BotFather):
+        father.send_message(text=str(PythonBot.interpreter(message.text)), chat_id=message.chat.id)
 
     @staticmethod
     def interpreter(query):

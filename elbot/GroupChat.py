@@ -20,14 +20,14 @@ class GroupChat:
 
     def __init__(self, title, group_id):
         self.title = title
-        self.group_id = group_id
+        self.id = group_id
 
 
 class GroupChatJSONEncoder(json.JSONEncoder):
     def default(self, obj: GroupChat):
         if obj is GroupChat:
             return {
-                'id': str(obj.group_id),
+                'id': str(obj.id),
                 'title': obj.title
             }
         else:

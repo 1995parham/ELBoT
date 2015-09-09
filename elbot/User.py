@@ -17,21 +17,21 @@ class User:
     :type username: str
     :type first_name: str
     :type last_name: str
-    :type user_id: int
+    :type id: int
     """
 
     def __init__(self, username, first_name, last_name, user_id):
         self.username = username
         self.first_name = first_name
         self.last_name = last_name
-        self.user_id = user_id
+        self.id = user_id
 
 
 class UserJSONEncoder(json.JSONEncoder):
     def default(self, obj: User):
         if obj is User:
             return {
-                'id': str(obj.user_id),
+                'id': str(obj.id),
                 'first_name': obj.first_name,
                 'last_name': obj.last_name,
                 'username': obj.username

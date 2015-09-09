@@ -8,22 +8,32 @@
 # =======================================
 __author__ = 'Parham Alvani'
 
-import requests
 import threading
+import time
+
+import json
+
+import requests
+
+from . import Update
 
 
 class BotFather(threading.Thread):
     """
     The main class which run commands and returns their response
-    :type: str
-    :type: str
+    :type hash_id: str
+    :type base_url: str
+    :type bots: []
     """
 
-    def __init__(self, hash_id):
+    def __init__(self, hash_id, bots=None):
+        if not bots:
+            bots = []
         super().__init__(name="Bot Thread {}".format(hash_id))
-        self.setDaemon(True)
+        self.setDaemon(False)
         self.hash_id = hash_id
         self.base_url = 'https://api.telegram.org/bot' + self.hash_id + '/'
+        self.bots = bots
 
     def send_message(self, chat_id: int, text: str, disable_web_page_preview: bool=False,
                      reply_to_message_id: int=0, reply_markup=None):
@@ -48,7 +58,7 @@ class BotFather(threading.Thread):
             params['reply_markup'] = reply_markup
         requests.get(url=self.base_url + 'sendMessage', params=params)
 
-    def get_updates(self, offset: int=0, limit: int=0, timeout: int=0):
+    def get_updates(self, offset: int=0, limit: int=0, timeout: int=0) -> [Update.Update]:
         """
         Use this method to receive incoming updates using long polling. An Array of Update objects is returned.
         :param offset: Identifier of the first update to be returned.
@@ -60,6 +70,7 @@ class BotFather(threading.Thread):
         :param timeout: Timeout in seconds for long polling. Defaults to 0, i.e. usual short polling
         :return: []
         """
+        updates = []
         params = {}
         if offset != 0:
             params['offset'] = offset
@@ -68,6 +79,23 @@ class BotFather(threading.Thread):
         if timeout != 0:
             params['timeout'] = timeout
         response = requests.get(url=self.base_url + 'getUpdates', params=params)
+        for obj in json.loads(response.text)['result']:
+            update = Update.UpdateDictDecoder.decode(obj)
+            updates.append(update)
+        return updates
 
     def run(self):
-        pass
+        update_id = 0
+        while True:
+            updates = self.get_updates(offset=update_id)
+            update_id = updates[-1].update_id
+            for update in updates:
+                message = update.message
+                for bot in self.bots:
+                    if message.text is not None and message.text.startswith("/" + bot.bot_name):
+                        query = message.text[1 + len(bot.bot_name):]
+                        query = query.lstrip()
+                        query = query.rstrip()
+                        message.text = query
+                        bot.run_query(message, self)
+        time.sleep(10)

@@ -8,4 +8,3 @@
 # =======================================
 __author__ = 'Parham Alvani'
 
-from bots import python_bot, ftp_bot, ser_bot, wiki_bot, history_bot
