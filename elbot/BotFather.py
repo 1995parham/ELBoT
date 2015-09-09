@@ -9,9 +9,10 @@
 __author__ = 'Parham Alvani'
 
 import requests
+import threading
 
 
-class BotFather:
+class BotFather(threading.Thread):
     """
     The main class which run commands and returns their response
     :type: str
@@ -19,6 +20,8 @@ class BotFather:
     """
 
     def __init__(self, hash_id):
+        super().__init__(name="Bot Thread {}".format(hash_id))
+        self.setDaemon(True)
         self.hash_id = hash_id
         self.base_url = 'https://api.telegram.org/bot' + self.hash_id + '/'
 
@@ -65,3 +68,6 @@ class BotFather:
         if timeout != 0:
             params['timeout'] = timeout
         response = requests.get(url=self.base_url + 'getUpdates', params=params)
+
+    def run(self):
+        pass
