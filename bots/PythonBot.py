@@ -18,7 +18,8 @@ class PythonBot(AbstractBot):
     bot_name = 'python'
 
     def run_query(self, message: Message, father: BotFather):
-        father.send_message(text=str(PythonBot.interpreter(message.text)), chat_id=message.chat.id)
+        father.send_message(text=str(PythonBot.interpreter(message.text)), chat_id=message.chat.id,
+                            reply_to_message_id=message.message_id)
 
     @staticmethod
     def interpreter(query):
