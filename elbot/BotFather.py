@@ -88,7 +88,8 @@ class BotFather(threading.Thread):
         update_id = 0
         while True:
             updates = self.get_updates(offset=update_id)
-            update_id = updates[-1].update_id
+            if len(updates) != 0:
+                update_id = updates[-1].update_id + 1
             for update in updates:
                 message = update.message
                 for bot in self.bots:
