@@ -8,9 +8,9 @@
 # =======================================
 __author__ = 'Parham Alvani'
 
-from elbot import BotFather
-from bots.PythonBot import PythonBot
-from bots.LyricBot import LyricBot
+from elbot.core import BotFather
+from elbot.bots.PythonBot import PythonBot
+from elbot.bots.LyricBot import LyricBot
 
 elbot = BotFather.BotFather('128827058:AAHss2FTdF7zKgFudkF7cUlOFbqFC66QO00', [PythonBot(), LyricBot()])
 elbot.start()

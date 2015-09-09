@@ -2,10 +2,8 @@
 # ========================================
 # [] File Name : __init__.py
 #
-# [] Creation Date : 26-08-2015
+# [] Creation Date : 09-09-2015
 #
 # [] Created By : Parham Alvani (parham.alvani@gmail.com)
 # =======================================
 __author__ = 'Parham Alvani'
-
-from elbot import core, bots

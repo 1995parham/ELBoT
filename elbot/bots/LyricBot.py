@@ -10,9 +10,9 @@ __author__ = 'Parham Alvani'
 
 import suds.client
 
-from elbot.AbstractBot import AbstractBot
-from elbot.Message import Message
-from elbot.BotFather import BotFather
+from elbot.core.AbstractBot import AbstractBot
+from elbot.core.Message import Message
+from elbot.core.BotFather import BotFather
 
 
 class LyricBot(AbstractBot):
