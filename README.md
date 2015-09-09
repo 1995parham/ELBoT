@@ -1,23 +1,15 @@
-ELBot
-===================
+# ELBot
+## Introduction
+This is a telegram bot was written in python.
 
-This is a telegram bot written in python. It uses the CLI of telegram by vysheng to connect.
+## Installation
 
-## Installation ##
-
-### Install and setup vysheng/tg ###
-Install [vysheng's tg cli](http://github.com/vysheng/tg/#installation)
-
-Run that and configure an account
-    
-    ./telegram -k tg-server.pub
-    
-### Download ELBoT ###
+### Download ELBoT
 Clone this repository by doing
     
     git clone https://github.com/1995parham/ELBoT.git && cd ELBoT
     
-### Running ELBot ###
+### Running ELBot
     
-    /path/to/tg-bin/ -Z bots.py
+    python3 main.py
     
