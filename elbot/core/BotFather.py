@@ -98,16 +98,19 @@ class BotFather(threading.Thread):
     def run(self):
         update_id = 0
         while True:
-            updates = self.get_updates(offset=update_id)
-            if len(updates) != 0:
-                update_id = updates[-1].update_id + 1
-            for update in updates:
-                message = update.message
-                for bot in self.bots:
-                    if message.text is not None and message.text.startswith("/" + bot.bot_name):
-                        query = message.text[1 + len(bot.bot_name):]
-                        query = query.lstrip()
-                        query = query.rstrip()
-                        message.text = query
-                        bot.run_query(message, self)
+            try:
+                updates = self.get_updates(offset=update_id)
+                if len(updates) != 0:
+                    update_id = updates[-1].update_id + 1
+                for update in updates:
+                    message = update.message
+                    for bot in self.bots:
+                        if message.text is not None and message.text.startswith("/" + bot.bot_name):
+                            query = message.text[1 + len(bot.bot_name):]
+                            query = query.lstrip()
+                            query = query.rstrip()
+                            message.text = query
+                            bot.run_query(message, self)
+            except Exception as ex:
+                print("Error: {}".format(ex))
         time.sleep(10)
