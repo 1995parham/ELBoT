@@ -29,7 +29,7 @@ class User:
 
 class UserJSONEncoder(json.JSONEncoder):
     def default(self, obj: User):
-        if obj is User:
+        if isinstance(obj, User):
             return {
                 'id': str(obj.id),
                 'first_name': obj.first_name,

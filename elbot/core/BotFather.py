@@ -16,6 +16,7 @@ import json
 import requests
 
 from . import Update
+from . import ReplyKeyboardMarkup
 
 
 class BotFather(threading.Thread):
@@ -23,7 +24,7 @@ class BotFather(threading.Thread):
     The main class which run commands and returns their response
     :type hash_id: str
     :type base_url: str
-    :type bots: []
+    :type bots: list[]
     """
 
     def __init__(self, hash_id, bots=None):
@@ -36,7 +37,8 @@ class BotFather(threading.Thread):
         self.bots = bots
 
     def send_message(self, chat_id: int, text: str, disable_web_page_preview: bool=False,
-                     reply_to_message_id: int=0, reply_markup=None):
+                     reply_to_message_id: int=0, reply_markup: ReplyKeyboardMarkup.ReplyKeyboardMarkup=None,
+                     parse_mode: str=""):
         """
         Use this method to send text messages. On success, the sent Message is returned.
         :param chat_id: Unique identifier for the message recipient — User or GroupChat id
@@ -45,6 +47,8 @@ class BotFather(threading.Thread):
         :param reply_to_message_id: If the message is a reply, ID of the original message
         :param reply_markup: Additional interface options. A JSON-serialized object for a custom reply keyboard,
                              instructions to hide keyboard or to force a reply from the user.
+        :param parse_mode: Send Markdown, if you want Telegram apps to show bold, italic and inline URLs in your
+                           bot's message. For the moment, only Telegram for Android supports this.
         :return: None
         """
         params = {
@@ -54,8 +58,10 @@ class BotFather(threading.Thread):
         }
         if reply_to_message_id != 0:
             params['reply_to_message_id'] = reply_to_message_id
-        if reply_markup is not None:
-            params['reply_markup'] = reply_markup
+        if reply_markup is not None and isinstance(reply_markup, ReplyKeyboardMarkup.ReplyKeyboardMarkup):
+            params['reply_markup'] = json.dumps(reply_markup, cls=ReplyKeyboardMarkup.ReplyKeyboardMarkdownJSONEncoder)
+        if parse_mode is not None:
+            params['parse_mode'] = parse_mode
         requests.get(url=self.base_url + 'sendMessage', params=params)
 
     def get_updates(self, offset: int=0, limit: int=0, timeout: int=0) -> [Update.Update]:
