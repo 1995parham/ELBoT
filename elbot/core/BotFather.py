@@ -62,7 +62,8 @@ class BotFather(threading.Thread):
             params['reply_markup'] = json.dumps(reply_markup, cls=ReplyKeyboardMarkup.ReplyKeyboardMarkdownJSONEncoder)
         if parse_mode is not None:
             params['parse_mode'] = parse_mode
-        requests.get(url=self.base_url + 'sendMessage', params=params)
+        requests.post(url=self.base_url + 'sendMessage', data=params,
+                      headers={'content-type': 'application/x-www-form-urlencoded'})
 
     def get_updates(self, offset: int=0, limit: int=0, timeout: int=0) -> [Update.Update]:
         """
@@ -85,9 +86,13 @@ class BotFather(threading.Thread):
         if timeout != 0:
             params['timeout'] = timeout
         response = requests.get(url=self.base_url + 'getUpdates', params=params)
-        for obj in json.loads(response.text)['result']:
-            update = Update.UpdateDictDecoder.decode(obj)
-            updates.append(update)
+        response = json.loads(response.text)
+        if response['ok']:
+            for obj in response['result']:
+                update = Update.UpdateDictDecoder.decode(obj)
+                updates.append(update)
+        else:
+            print("We get error at {}".format(response['result']))
         return updates
 
     def run(self):
