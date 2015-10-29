@@ -36,9 +36,9 @@ class BotFather(threading.Thread):
         self.base_url = 'https://api.telegram.org/bot' + self.hash_id + '/'
         self.bots = bots
 
-    def send_message(self, chat_id: int, text: str, disable_web_page_preview: bool=False,
-                     reply_to_message_id: int=0, reply_markup: ReplyKeyboardMarkup.ReplyKeyboardMarkup=None,
-                     parse_mode: str=""):
+    def send_message(self, chat_id: int, text: str, disable_web_page_preview: bool = False,
+                     reply_to_message_id: int = 0, reply_markup: ReplyKeyboardMarkup.ReplyKeyboardMarkup = None,
+                     parse_mode: str = ""):
         """
         Use this method to send text messages. On success, the sent Message is returned.
         :param chat_id: Unique identifier for the message recipient — User or GroupChat id
@@ -65,7 +65,45 @@ class BotFather(threading.Thread):
         requests.post(url=self.base_url + 'sendMessage', data=params,
                       headers={'content-type': 'application/x-www-form-urlencoded'})
 
-    def get_updates(self, offset: int=0, limit: int=0, timeout: int=0) -> [Update.Update]:
+    def send_chat_action(self, chat_id: int, action: str):
+
+        """
+        Use this method to send text messages. On success, the sent Message is returned.
+        :param chat_id: Unique identifier for the message recipient — User or GroupChat id
+        :param action: Type of action to broadcast. Choose one, depending on what the user is about to receive:
+                       typing for text messages,
+                       upload_photo for photos,
+                       record_video or upload_video for videos,
+                       record_audio or upload_audio for audio files,
+                       upload_document for general files,
+                       find_location for location data.
+        :return: None
+        """
+        params = {
+            'chat_id': str(chat_id),
+            'action': action,
+        }
+        requests.post(url=self.base_url + 'sendChatAction', data=params,
+                      headers={'content-type': 'application/x-www-form-urlencoded'})
+
+    def send_video(self, chat_id: int, video: str, reply_to_message_id: int = 0, caption: str = ""):
+        """
+
+        :param chat_id: Unique identifier for the message recipient — User or GroupChat id
+        :param video: Path to video
+        :param reply_to_message_id: If the message is a reply, ID of the original message
+        :return: None
+        """
+        params = {
+            'chat_id': str(chat_id),
+        }
+        if reply_to_message_id != 0:
+            params['reply_to_message_id'] = reply_to_message_id
+        if caption != "":
+            params['caption'] = caption
+        requests.post(url=self.base_url + 'sendVideo', params=params, files={'video': open(video, 'rb')})
+
+    def get_updates(self, offset: int = 0, limit: int = 0, timeout: int = 0) -> [Update.Update]:
         """
         Use this method to receive incoming updates using long polling. An Array of Update objects is returned.
         :param offset: Identifier of the first update to be returned.
