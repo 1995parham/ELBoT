@@ -151,4 +151,5 @@ class BotFather(threading.Thread):
                             bot.run_query(message, self)
             except Exception as ex:
                 print("Error: {}".format(ex))
+                raise ex
         time.sleep(10)
