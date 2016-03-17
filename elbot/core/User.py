@@ -43,5 +43,5 @@ class UserJSONEncoder(json.JSONEncoder):
 class UserDictDecoder:
     @staticmethod
     def decode(obj: dict) -> User:
-        return User(user_id=int(obj['id']), username=obj['username'], first_name=obj['first_name'],
-                    last_name=obj['last_name'])
+        return User(user_id=int(obj['id']), username=obj.get('username', ''), first_name=obj['first_name'],
+                    last_name=obj.get('last_name', ''))

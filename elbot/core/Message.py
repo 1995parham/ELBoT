@@ -10,7 +10,6 @@ __author__ = 'Parham Alvani'
 
 from . import User
 from . import GroupChat
-
 import datetime
 
 
@@ -64,9 +63,10 @@ class MessageDictDecoder:
             reply_to_message = None
 
         # Message.chat
-        if obj['chat'].get('username', None):
+        type = obj['chat']['type']
+        if type == 'private':
             chat = User.UserDictDecoder.decode(obj['chat'])
-        else:
+        elif type == 'group':
             chat = GroupChat.GroupChatDictDecoder.decode(obj['chat'])
 
         return Message(message_id=int(obj['message_id']), src=User.UserDictDecoder.decode(obj['from']),
