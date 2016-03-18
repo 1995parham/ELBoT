@@ -6,7 +6,6 @@
 #
 # [] Created By : Parham Alvani (parham.alvani@gmail.com)
 # =======================================
-__author__ = 'Parham Alvani'
 
 import threading
 import time
@@ -15,8 +14,8 @@ import json
 
 import requests
 
-from . import Update
-from . import ReplyKeyboardMarkup
+from elbot.core import Update
+from elbot.core import ReplyKeyboardMarkup
 
 
 class BotFather(threading.Thread):
@@ -36,15 +35,21 @@ class BotFather(threading.Thread):
         self.base_url = 'https://api.telegram.org/bot' + self.hash_id + '/'
         self.bots = bots
 
-    def send_message(self, chat_id: int, text: str, disable_web_page_preview: bool = False,
-                     reply_to_message_id: int = 0, reply_markup: ReplyKeyboardMarkup.ReplyKeyboardMarkup = None,
+    def send_message(self, chat_id: int, text: str,
+                     disable_web_page_preview: bool = False,
+                     reply_to_message_id: int = 0,
+                     reply_markup: ReplyKeyboardMarkup.ReplyKeyboardMarkup = None,
                      parse_mode: str = ""):
         """
-        Use this method to send text messages. On success, the sent Message is returned.
-        :param chat_id: Unique identifier for the message recipient — User or GroupChat id
+        Use this method to send text messages.
+        On success, the sent Message is returned.
+        :param chat_id: Unique identifier for the message recipient —
+                        User or GroupChat id
         :param text: Text of the message to be sent
-        :param disable_web_page_preview: Disables link previews for links in this message
-        :param reply_to_message_id: If the message is a reply, ID of the original message
+        :param disable_web_page_preview: Disables link previews for
+                                        links in this message
+        :param reply_to_message_id: If the message is a reply,
+                                    ID of the original message
         :param reply_markup: Additional interface options. A JSON-serialized object for a custom reply keyboard,
                              instructions to hide keyboard or to force a reply from the user.
         :param parse_mode: Send Markdown, if you want Telegram apps to show bold, italic and inline URLs in your
@@ -58,12 +63,15 @@ class BotFather(threading.Thread):
         }
         if reply_to_message_id != 0:
             params['reply_to_message_id'] = reply_to_message_id
-        if reply_markup is not None and isinstance(reply_markup, ReplyKeyboardMarkup.ReplyKeyboardMarkup):
-            params['reply_markup'] = json.dumps(reply_markup, cls=ReplyKeyboardMarkup.ReplyKeyboardMarkdownJSONEncoder)
+        if reply_markup is not None and isinstance(reply_markup,
+                                                   ReplyKeyboardMarkup.ReplyKeyboardMarkup):
+            params['reply_markup'] = json.dumps(reply_markup,
+                                                cls=ReplyKeyboardMarkup.ReplyKeyboardMarkdownJSONEncoder)
         if parse_mode is not None:
             params['parse_mode'] = parse_mode
         requests.post(url=self.base_url + 'sendMessage', data=params,
-                      headers={'content-type': 'application/x-www-form-urlencoded'})
+                      headers={
+                          'content-type': 'application/x-www-form-urlencoded'})
 
     def send_chat_action(self, chat_id: int, action: str):
 
@@ -84,9 +92,11 @@ class BotFather(threading.Thread):
             'action': action,
         }
         requests.post(url=self.base_url + 'sendChatAction', data=params,
-                      headers={'content-type': 'application/x-www-form-urlencoded'})
+                      headers={
+                          'content-type': 'application/x-www-form-urlencoded'})
 
-    def send_video(self, chat_id: int, video: str, reply_to_message_id: int = 0, caption: str = ""):
+    def send_video(self, chat_id: int, video: str,
+                   reply_to_message_id: int = 0, caption: str = ""):
         """
 
         :param chat_id: Unique identifier for the message recipient — User or GroupChat id
@@ -101,9 +111,11 @@ class BotFather(threading.Thread):
             params['reply_to_message_id'] = reply_to_message_id
         if caption != "":
             params['caption'] = caption
-        requests.post(url=self.base_url + 'sendVideo', params=params, files={'video': open(video, 'rb')})
+        requests.post(url=self.base_url + 'sendVideo', params=params,
+                      files={'video': open(video, 'rb')})
 
-    def get_updates(self, offset: int = 0, limit: int = 0, timeout: int = 0) -> [Update.Update]:
+    def get_updates(self, offset: int = 0, limit: int = 0,
+                    timeout: int = 0) -> [Update.Update]:
         """
         Use this method to receive incoming updates using long polling. An Array of Update objects is returned.
         :param offset: Identifier of the first update to be returned.
@@ -123,7 +135,8 @@ class BotFather(threading.Thread):
             params['limit'] = limit
         if timeout != 0:
             params['timeout'] = timeout
-        response = requests.get(url=self.base_url + 'getUpdates', params=params)
+        response = requests.get(url=self.base_url + 'getUpdates',
+                                params=params)
         response = json.loads(response.text)
         if response['ok']:
             for obj in response['result']:
@@ -143,7 +156,8 @@ class BotFather(threading.Thread):
                 for update in updates:
                     message = update.message
                     for bot in self.bots:
-                        if message.text is not None and message.text.startswith("/" + bot.bot_name):
+                        if message.text is not None and message.text.startswith(
+                                        "/" + bot.bot_name):
                             query = message.text[1 + len(bot.bot_name):]
                             query = query.lstrip()
                             query = query.rstrip()
