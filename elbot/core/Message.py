@@ -6,10 +6,9 @@
 #
 # [] Created By : Parham Alvani (parham.alvani@gmail.com)
 # =======================================
-__author__ = 'Parham Alvani'
 
-from . import User
-from . import GroupChat
+from elbot.core import User
+from elbot.core import GroupChat
 import datetime
 
 

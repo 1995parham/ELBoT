@@ -6,9 +6,8 @@
 #
 # [] Created By : Parham Alvani (parham.alvani@gmail.com)
 # =======================================
-__author__ = 'Parham Alvani'
 
-from . import Message
+from elbot.core import Message
 
 
 class Update:
@@ -26,4 +25,6 @@ class Update:
 class UpdateDictDecoder:
     @staticmethod
     def decode(obj: dict) -> Update:
-        return Update(update_id=int(obj['update_id']), message=Message.MessageDictDecoder.decode(obj['message']))
+        return Update(update_id=int(obj['update_id']),
+                      message=Message.MessageDictDecoder.decode(
+                          obj['message']))

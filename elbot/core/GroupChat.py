@@ -6,7 +6,6 @@
 #
 # [] Created By : Parham Alvani (parham.alvani@gmail.com)
 # =======================================
-__author__ = 'Parham Alvani'
 
 import json
 
@@ -25,13 +24,13 @@ class GroupChat:
 
 class GroupChatJSONEncoder(json.JSONEncoder):
     def default(self, obj: GroupChat):
-        if obj is GroupChat:
+        if isinstance(obj, GroupChat):
             return {
                 'id': str(obj.id),
                 'title': obj.title
             }
         else:
-            raise TypeError("UserJsonEncoder got {} instead of User.".format(type(obj)))
+            raise TypeError("GroupChatJsonEncoder got {} instead of GroupChat.".format(type(obj)))
 
 
 class GroupChatDictDecoder:
