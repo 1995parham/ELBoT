@@ -20,10 +20,10 @@ for installing *requests* package use following command:
 	pip3 install requests
 ```
 ### Download & Running ELBoT
-Clone this repository by doing
+Do following thing in shell and have fun :)
 ```shell
-    git clone https://github.com/1995parham/ELBoT.git && cd ELBoT
-    ./run.sh
+git clone https://github.com/1995parham/ELBoT.git && cd ELBoT
+./run.sh
 ```
 ## ToDo
 1. Providing setup.py script
