@@ -8,11 +8,13 @@
 # =======================================
 __author__ = 'Parham Alvani'
 
-from elbot.core.AbstractBot import AbstractBot
-from elbot.core.Message import Message
-from elbot.core.BotFather import BotFather
-from pytube import YouTube
 import os
+
+from pytube import YouTube
+
+from elbot.core.AbstractBot import AbstractBot
+from elbot.core.BotFather import BotFather
+from elbot.domain.Message import Message
 
 
 class YouTubeBot(AbstractBot):

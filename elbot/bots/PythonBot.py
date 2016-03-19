@@ -8,10 +8,9 @@
 # =======================================
 __author__ = 'Parham Alvani'
 
-from math import *
 from elbot.core.AbstractBot import AbstractBot
-from elbot.core.Message import Message
 from elbot.core.BotFather import BotFather
+from elbot.domain.Message import Message
 
 
 class PythonBot(AbstractBot):

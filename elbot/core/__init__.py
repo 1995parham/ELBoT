@@ -8,4 +8,3 @@
 # =======================================
 __author__ = 'Parham Alvani'
 
-from elbot.core import Update, User, Message, GroupChat, BotFather, AbstractBot

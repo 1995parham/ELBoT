@@ -7,8 +7,8 @@
 # [] Created By : Parham Alvani (parham.alvani@gmail.com)
 # =======================================
 
-from elbot.core.Message import Message
 from elbot.core.BotFather import BotFather
+from elbot.domain.Message import Message
 
 
 class AbstractBot:

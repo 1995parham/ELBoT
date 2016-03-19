@@ -8,13 +8,13 @@
 # =======================================
 __author__ = 'Parham Alvani'
 
-import urllib.request
-import urllib.parse
 import json
+import urllib.parse
+import urllib.request
 
 from elbot.core.AbstractBot import AbstractBot
 from elbot.core.BotFather import BotFather
-from elbot.core.Message import Message
+from elbot.domain.Message import Message
 
 
 class GoogleBot(AbstractBot):

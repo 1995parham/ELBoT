@@ -7,15 +7,14 @@
 # [] Created By : Parham Alvani (parham.alvani@gmail.com)
 # =======================================
 
+import json
 import threading
 import time
-
-import json
 
 import requests
 
 from elbot.core import Update
-from elbot.core import ReplyKeyboardMarkup
+from elbot.domain import ReplyKeyboardMarkup
 
 
 class BotFather(threading.Thread):
