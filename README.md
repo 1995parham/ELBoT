@@ -17,7 +17,7 @@ This platform use *requests* package in order to create REST requests
 for telegram server.
 for installing *requests* package use following command:
 ```shell
-	pip3 install requests
+pip3 install requests
 ```
 ### Download & Running ELBoT
 Do following thing in shell and have fun :)
