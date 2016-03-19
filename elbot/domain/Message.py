@@ -9,7 +9,7 @@
 
 import datetime
 
-from elbot.core import GroupChat
+from elbot.domain import GroupChat
 from elbot.domain import User
 
 

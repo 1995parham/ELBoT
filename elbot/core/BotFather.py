@@ -13,7 +13,7 @@ import time
 
 import requests
 
-from elbot.core import Update
+from elbot.domain import Update
 from elbot.domain import ReplyKeyboardMarkup
 
 
