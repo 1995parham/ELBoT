@@ -6,10 +6,9 @@
 #
 # [] Created By : Parham Alvani (parham.alvani@gmail.com)
 # =======================================
-__author__ = 'Parham Alvani'
 
-from .Message import Message
-from .BotFather import BotFather
+from elbot.core.Message import Message
+from elbot.core.BotFather import BotFather
 
 
 class AbstractBot:

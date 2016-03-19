@@ -6,7 +6,6 @@
 #
 # [] Created By : Parham Alvani (parham.alvani@gmail.com)
 # =======================================
-__author__ = 'Parham Alvani'
 
 import json
 
@@ -37,11 +36,13 @@ class UserJSONEncoder(json.JSONEncoder):
                 'username': obj.username
             }
         else:
-            raise TypeError("UserJsonEncoder got {} instead of User.".format(type(obj)))
+            raise TypeError(
+                "UserJsonEncoder got {} instead of User.".format(type(obj)))
 
 
 class UserDictDecoder:
     @staticmethod
     def decode(obj: dict) -> User:
-        return User(user_id=int(obj['id']), username=obj.get('username', ''), first_name=obj['first_name'],
+        return User(user_id=int(obj['id']), username=obj.get('username', ''),
+                    first_name=obj['first_name'],
                     last_name=obj.get('last_name', ''))
