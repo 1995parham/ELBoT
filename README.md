@@ -27,6 +27,6 @@ git clone https://github.com/1995parham/ELBoT.git && cd ELBoT
 ```
 ## ToDo
 - [x] Improve project packaging
-- [] Add old source of ELBot :)
-- [] Providing setup.py script
-- [] Create API documentation
+- [ ] Add old source of ELBot :)
+- [ ] Providing setup.py script
+- [ ] Create API documentation
