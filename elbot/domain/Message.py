@@ -7,9 +7,10 @@
 # [] Created By : Parham Alvani (parham.alvani@gmail.com)
 # =======================================
 
-from elbot.core import User
-from elbot.core import GroupChat
 import datetime
+
+from elbot.core import GroupChat
+from elbot.domain import User
 
 
 class Message:

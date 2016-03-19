@@ -7,7 +7,7 @@
 # [] Created By : Parham Alvani (parham.alvani@gmail.com)
 # =======================================
 
-from elbot.core import Message
+from elbot.domain import Message
 
 
 class Update:
