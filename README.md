@@ -1,15 +1,11 @@
 # ELBot
 ## Introduction
-This is a telegram bot was written in python.
+This is a telegram bot written in python.
 This bot run standalone as a telegram bot and
 use [telegram bot API](https://core.telegram.org/bots/api) for doing its job :).
-If you want have some automated tasks on your phone number
-base telegram you must use something like [Telegram CLI](https://github.com/vysheng/tg) and
+If you want to have some automated tasks on your phone number
+based on telegram, you must use something like [Telegram CLI](https://github.com/vysheng/tg) and
 run scripts on it.
-
-## ELBot ?
-ELBot was named after one of my friends name who introduced me
-to telegram, instagram, ... and after all I close all of them :D
 
 ## Installation
 ### Dependencies
