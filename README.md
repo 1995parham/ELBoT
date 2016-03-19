@@ -26,5 +26,7 @@ git clone https://github.com/1995parham/ELBoT.git && cd ELBoT
 ./run.sh
 ```
 ## ToDo
-1. Providing setup.py script
-2. Create API documentation
+[X] Improve project packaging
+[] Add old source of ELBot :)
+[] Providing setup.py script
+[] Create API documentation
