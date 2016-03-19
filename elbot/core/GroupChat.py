@@ -30,7 +30,9 @@ class GroupChatJSONEncoder(json.JSONEncoder):
                 'title': obj.title
             }
         else:
-            raise TypeError("GroupChatJsonEncoder got {} instead of GroupChat.".format(type(obj)))
+            raise TypeError(
+                "GroupChatJsonEncoder got {} instead of GroupChat.".format(
+                    type(obj)))
 
 
 class GroupChatDictDecoder:
