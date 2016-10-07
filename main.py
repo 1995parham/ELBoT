@@ -1,3 +1,4 @@
+#!/usr/bin/env python3
 # In The Name Of God
 # ========================================
 # [] File Name : main.py
@@ -6,8 +7,6 @@
 #
 # [] Created By : Parham Alvani (parham.alvani@gmail.com)
 # =======================================
-__author__ = 'Parham Alvani'
-
 from elbot.core import BotFather
 from elbot.bots.PythonBot import PythonBot
 from elbot.bots.LyricBot import LyricBot
