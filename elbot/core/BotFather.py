@@ -13,8 +13,9 @@ import time
 
 import requests
 
-from elbot.domain import Update
-from elbot.domain import ReplyKeyboardMarkup
+from ..domain.update import Update
+from ..domain.keyboard import ReplyKeyboardMarkup, \
+     ReplyKeyboardMarkdownJSONEncoder
 
 
 class BotFather(threading.Thread):
@@ -37,7 +38,7 @@ class BotFather(threading.Thread):
     def send_message(self, chat_id: int, text: str,
                      disable_web_page_preview: bool = False,
                      reply_to_message_id: int = 0,
-                     reply_markup: ReplyKeyboardMarkup.ReplyKeyboardMarkup = None,
+                     reply_markup: ReplyKeyboardMarkup = None,
                      parse_mode: str = ""):
         """
         Use this method to send text messages.
@@ -63,9 +64,9 @@ class BotFather(threading.Thread):
         if reply_to_message_id != 0:
             params['reply_to_message_id'] = reply_to_message_id
         if reply_markup is not None and isinstance(reply_markup,
-                                                   ReplyKeyboardMarkup.ReplyKeyboardMarkup):
+                                                   ReplyKeyboardMarkup):
             params['reply_markup'] = json.dumps(reply_markup,
-                                                cls=ReplyKeyboardMarkup.ReplyKeyboardMarkdownJSONEncoder)
+                                                cls=ReplyKeyboardMarkdownJSONEncoder)
         if parse_mode is not None:
             params['parse_mode'] = parse_mode
         requests.post(url=self.base_url + 'sendMessage', data=params,
@@ -155,8 +156,7 @@ class BotFather(threading.Thread):
                 for update in updates:
                     message = update.message
                     for bot in self.bots:
-                        if message.text is not None and message.text.startswith(
-                                        "/" + bot.bot_name):
+                        if message.text is not None and message.text.startswith("/" + bot.bot_name):
                             query = message.text[1 + len(bot.bot_name):]
                             query = query.lstrip()
                             query = query.rstrip()
