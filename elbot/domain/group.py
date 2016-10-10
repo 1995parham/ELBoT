@@ -1,12 +1,11 @@
 # In The Name Of God
 # ========================================
-# [] File Name : GroupChat
+# [] File Name : group.py
 #
 # [] Creation Date : 26-08-2015
 #
 # [] Created By : Parham Alvani (parham.alvani@gmail.com)
 # =======================================
-
 import json
 
 

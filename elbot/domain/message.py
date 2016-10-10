@@ -1,6 +1,6 @@
 # In The Name Of God
 # ========================================
-# [] File Name : Message.py
+# [] File Name : message.py
 #
 # [] Creation Date : 27-08-2015
 #
@@ -9,8 +9,8 @@
 
 import datetime
 
-from elbot.domain import GroupChat
-from elbot.domain import User
+from .group import GroupChat
+from .user import User
 
 
 class Message:
@@ -19,9 +19,9 @@ class Message:
     :type message_id: int
     :type src: User.User
     :type date: datetime.datetime
-    :type chat: User.User or GroupChat.GroupChat
+    :type chat: User or GroupChat
     :type text: str
-    :type forward_from: User.User
+    :type forward_from: User
     :type forward_date: datetime.datetime
     :type reply_to_message: Message
     """

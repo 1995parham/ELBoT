@@ -1,12 +1,11 @@
 # In The Name Of God
 # ========================================
-# [] File Name : User.py
+# [] File Name : user.py
 #
 # [] Creation Date : 26-08-2015
 #
 # [] Created By : Parham Alvani (parham.alvani@gmail.com)
 # =======================================
-
 import json
 
 
