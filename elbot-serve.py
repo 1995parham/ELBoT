@@ -1,12 +1,5 @@
 #!/usr/bin/env python3
-# In The Name Of God
-# ========================================
-# [] File Name : main.py
-#
-# [] Creation Date : 09-09-2015
-#
-# [] Created By : Parham Alvani (parham.alvani@gmail.com)
-# =======================================
+
 from elbot.core import BotFather
 from elbot.bots.PythonBot import PythonBot
 from elbot.bots.LyricBot import LyricBot
