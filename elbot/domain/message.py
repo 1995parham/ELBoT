@@ -9,8 +9,8 @@
 
 import datetime
 
-from .group import GroupChat
-from .user import User
+from .group import GroupChatDictDecoder
+from .user import UserDictDecoder
 
 
 class Message:
@@ -47,7 +47,7 @@ class MessageDictDecoder:
 
         # Message.forward_from
         if obj.get('forward_from', None):
-            forward_from = User.UserDictDecoder.decode(obj['forward_from'])
+            forward_from = UserDictDecoder.decode(obj['forward_from'])
         else:
             forward_from = None
 
@@ -67,12 +67,12 @@ class MessageDictDecoder:
         # Message.chat
         type = obj['chat']['type']
         if type == 'private':
-            chat = User.UserDictDecoder.decode(obj['chat'])
+            chat = UserDictDecoder.decode(obj['chat'])
         elif type == 'group':
-            chat = GroupChat.GroupChatDictDecoder.decode(obj['chat'])
+            chat = GroupChatDictDecoder.decode(obj['chat'])
 
         return Message(message_id=int(obj['message_id']),
-                       src=User.UserDictDecoder.decode(obj['from']),
+                       src=UserDictDecoder.decode(obj['from']),
                        date=datetime.datetime.fromtimestamp(obj['date']),
                        chat=chat, text=text,
                        forward_from=forward_from, forward_date=forward_date,

@@ -7,7 +7,7 @@
 # [] Created By : Parham Alvani (parham.alvani@gmail.com)
 # =======================================
 
-from .message import Message
+from .message import Message, MessageDictDecoder
 
 
 class Update:
@@ -17,7 +17,7 @@ class Update:
     :type message: Message
     """
 
-    def __init__(self, update_id, message=None):
+    def __init__(self, update_id: int, message: Message=None):
         self.update_id = update_id
         self.message = message
 
@@ -26,5 +26,5 @@ class UpdateDictDecoder:
     @staticmethod
     def decode(obj: dict) -> Update:
         return Update(update_id=int(obj['update_id']),
-                      message=Message.MessageDictDecoder.decode(
+                      message=MessageDictDecoder.decode(
                           obj['message']))
