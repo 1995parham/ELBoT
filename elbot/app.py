@@ -9,6 +9,8 @@
 import time
 import requests
 import json
+import threading
+import re
 
 from .domain.update import Update, UpdateDictDecoder
 
@@ -17,6 +19,7 @@ class ELBot:
     def __init__(self, hash_id):
         self.hash_id = hash_id
         self.base_url = 'https://api.telegram.org/bot' + self.hash_id + '/'
+        self.message_handlers = {}
 
     def get_updates(self, offset: int = 0, limit: int = 0,
                     timeout: int = 0) -> [Update]:
@@ -56,6 +59,13 @@ class ELBot:
             print("We get error at {}".format(response['result']))
         return updates
 
+    def message(self, message: str):
+        def _message(fn):
+            pattern = re.compile(message)
+            self.message_handlers[pattern] = fn
+            return fn
+        return _message
+
     def run(self):
         update_id = 0
         while True:
@@ -65,6 +75,11 @@ class ELBot:
                     update_id = updates[-1].update_id + 1
                 for update in updates:
                     message = update.message
+                    for pattern in self.message_handlers:
+                        if pattern.match(message) is not None:
+                            threading.Thread(
+                                target=self.message_handlers[pattern],
+                                daemon=True)
                     print(message.text)
             except Exception as ex:
                 print("Error: {}".format(ex))
