@@ -18,7 +18,12 @@ from .domain.keyboard import ReplyKeyboardMarkup, \
 
 
 class ELBot:
-    def __init__(self, hash_id):
+    '''
+    ELBot represents core application module for creating a bot,
+    define your handlers and use ELBot as a helper for sending things,
+    You are done :D
+    '''
+    def __init__(self, hash_id: str):
         self.hash_id = hash_id
         self.base_url = 'https://api.telegram.org/bot' + self.hash_id + '/'
         self.message_handlers = {}
