@@ -13,6 +13,8 @@ import threading
 import re
 
 from .domain.update import Update, UpdateDictDecoder
+from .domain.keyboard import ReplyKeyboardMarkup, \
+     ReplyKeyboardMarkdownJSONEncoder
 
 
 class ELBot:
@@ -20,6 +22,48 @@ class ELBot:
         self.hash_id = hash_id
         self.base_url = 'https://api.telegram.org/bot' + self.hash_id + '/'
         self.message_handlers = {}
+
+    def send_message(self, chat_id: int, text: str,
+                     disable_web_page_preview: bool = False,
+                     reply_to_message_id: int = 0,
+                     reply_markup: ReplyKeyboardMarkup = None,
+                     parse_mode: str = ""):
+        """
+        Use this method to send text messages.
+        On success, the sent Message is returned.
+        :param chat_id: Unique identifier for the message recipient —
+                        User or GroupChat id
+        :param text: Text of the message to be sent
+        :param disable_web_page_preview: Disables link previews for
+                                        links in this message
+        :param reply_to_message_id: If the message is a reply,
+                                    ID of the original message
+        :param reply_markup: Additional interface options. A JSON-serialized
+                             object for a custom reply keyboard,
+                             instructions to hide keyboard or to force a reply
+                             from the user.
+        :param parse_mode: Send Markdown, if you want Telegram apps to show
+                           bold, italic and inline URLs in your
+                           bot's message. For the moment,
+                           only Telegram for Android supports this.
+        :return: None
+        """
+        params = {
+            'chat_id': str(chat_id),
+            'text': text,
+            'disable_web_page_preview': disable_web_page_preview,
+        }
+        if reply_to_message_id != 0:
+            params['reply_to_message_id'] = reply_to_message_id
+        if reply_markup is not None and isinstance(reply_markup,
+                                                   ReplyKeyboardMarkup):
+            params['reply_markup'] = json.dumps(reply_markup,
+                                                cls=ReplyKeyboardMarkdownJSONEncoder)
+        if parse_mode is not None:
+            params['parse_mode'] = parse_mode
+        requests.post(url=self.base_url + 'sendMessage', data=params,
+                      headers={
+                          'content-type': 'application/x-www-form-urlencoded'})
 
     def get_updates(self, offset: int = 0, limit: int = 0,
                     timeout: int = 0) -> [Update]:
@@ -76,10 +120,10 @@ class ELBot:
                 for update in updates:
                     message = update.message
                     for pattern in self.message_handlers:
-                        if pattern.match(message) is not None:
+                        if pattern.match(message.text) is not None:
                             threading.Thread(
                                 target=self.message_handlers[pattern],
-                                daemon=True)
+                                daemon=True).start()
                     print(message.text)
             except Exception as ex:
                 print("Error: {}".format(ex))
