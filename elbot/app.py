@@ -135,10 +135,10 @@ class ELBot:
                     message = update.message
                     for pattern in self.message_handlers:
                         if pattern.fullmatch(message.text):
+                            logger.info('Handling: %s' % message.text)
                             threading.Thread(
                                 target=self.message_handlers[pattern],
                                 args=(message,), daemon=True).start()
-                    logger.info(message.text)
             except Exception as ex:
                 print("Error: {}".format(ex))
                 raise ex
