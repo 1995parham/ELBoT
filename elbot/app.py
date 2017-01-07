@@ -138,7 +138,7 @@ class ELBot:
                     if message is None:
                         continue
                     for pattern in self.message_handlers:
-                        if pattern.fullmatch(message.text):
+                        if pattern.match(message.text) is not None:
                             logger.info('Handling: %s' % message.text)
                             threading.Thread(
                                 target=self.message_handlers[pattern],
