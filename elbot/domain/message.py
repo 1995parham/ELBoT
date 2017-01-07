@@ -17,7 +17,7 @@ class Message:
     """
     This object represents a message.
     :type message_id: int
-    :type src: User.User
+    :type src: User
     :type date: datetime.datetime
     :type chat: User or GroupChat
     :type text: str
