@@ -125,6 +125,8 @@ class ELBot:
         return _message
 
     def run(self):
+        print(' * 18.20 at Sep 07 2016 7:20 IR721')
+        print(" * ELBot at %s" % self.hash_id)
         update_id = 0
         while True:
             try:
