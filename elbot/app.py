@@ -135,6 +135,8 @@ class ELBot:
                     update_id = updates[-1].id + 1
                 for update in updates:
                     message = update.message
+                    if message is None:
+                        continue
                     for pattern in self.message_handlers:
                         if pattern.fullmatch(message.text):
                             logger.info('Handling: %s' % message.text)

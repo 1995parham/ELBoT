@@ -27,4 +27,4 @@ class UpdateDictDecoder:
     def decode(obj: dict) -> Update:
         return Update(update_id=int(obj['update_id']),
                       message=MessageDictDecoder.decode(
-                          obj['message']))
+                          obj['message']) if 'message' in obj else None)
