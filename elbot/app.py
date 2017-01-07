@@ -11,10 +11,14 @@ import requests
 import json
 import threading
 import re
+import logging
 
 from .domain.update import Update, UpdateDictDecoder
 from .domain.keyboard import ReplyKeyboardMarkup, \
      ReplyKeyboardMarkdownJSONEncoder
+
+
+logger = logging.getLogger('ELBot.app')
 
 
 class ELBot:
@@ -130,11 +134,11 @@ class ELBot:
                 for update in updates:
                     message = update.message
                     for pattern in self.message_handlers:
-                        if pattern.match(message.text) is not None:
+                        if pattern.fullmatch(message.text):
                             threading.Thread(
                                 target=self.message_handlers[pattern],
-                                daemon=True).start()
-                    print(message.text)
+                                args=(message,), daemon=True).start()
+                    logger.info(message.text)
             except Exception as ex:
                 print("Error: {}".format(ex))
                 raise ex
