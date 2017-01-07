@@ -130,7 +130,7 @@ class ELBot:
             try:
                 updates = self.get_updates(offset=update_id)
                 if len(updates) != 0:
-                    update_id = updates[-1].update_id + 1
+                    update_id = updates[-1].id + 1
                 for update in updates:
                     message = update.message
                     for pattern in self.message_handlers:
