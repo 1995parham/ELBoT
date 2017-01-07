@@ -29,7 +29,7 @@ class Message:
     def __init__(self, message_id, src, date, chat, text='', forward_from=None,
                  forward_date=None,
                  reply_to_message=None):
-        self.message_id = message_id
+        self.id = message_id
         self.src = src
         self.date = date
         self.chat = chat

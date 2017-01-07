@@ -18,7 +18,7 @@ class Update:
     """
 
     def __init__(self, update_id: int, message: Message=None):
-        self.update_id = update_id
+        self.id = update_id
         self.message = message
 
 
