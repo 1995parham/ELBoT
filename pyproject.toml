@@ -1,0 +1,32 @@
+[project]
+name = "elbot"
+version = "0.2.0"
+description = "Parham's Telegram secretary — a bot-mode chatbot and a user-mode MTProto client"
+readme = "README.md"
+requires-python = ">=3.14"
+license = { text = "MIT" }
+authors = [{ name = "Parham Alvani", email = "parham.alvani@gmail.com" }]
+dependencies = [
+    "telethon>=1.41",
+    "python-socks[asyncio]>=2.4",
+]
+
+[dependency-groups]
+dev = [
+    "ruff>=0.16",
+    "ty>=0.0.75",
+]
+
+[tool.ruff]
+target-version = "py314"
+line-length = 120
+
+[tool.ruff.lint]
+select = ["E", "F", "W", "I", "UP", "B", "SIM", "C4"]
+
+[tool.ty.environment]
+python-version = "3.14"
+
+[tool.ty.rules]
+# telethon ships no type information; silence unresolved-attribute noise from it
+unresolved-attribute = "ignore"

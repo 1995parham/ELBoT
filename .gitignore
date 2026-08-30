@@ -1,0 +1,20 @@
+# --- credentials: never commit these; they live in the private keys repo ---
+api.json
+token
+*.authkey
+*.session
+*.session-journal
+
+# --- python ---
+__pycache__/
+*.py[cod]
+.venv/
+venv/
+.uv/
+uv.lock
+
+# --- tooling caches ---
+.ruff_cache/
+.ty_cache/
+.mypy_cache/
+.pytest_cache/
