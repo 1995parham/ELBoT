@@ -1,7 +1,7 @@
 [project]
 name = "elbot"
 version = "0.2.0"
-description = "Parham's Telegram secretary — a bot-mode chatbot and a user-mode MTProto client"
+description = "Parham's Telegram secretary — a user-mode MTProto client"
 readme = "README.md"
 requires-python = ">=3.14"
 license = { text = "MIT" }
