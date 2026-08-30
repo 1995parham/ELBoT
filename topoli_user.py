@@ -63,9 +63,7 @@ except ImportError:  # pragma: no cover - guidance beats a traceback
     )
 
 SKILL_DIR = Path(__file__).resolve().parent
-STATE_DIR = Path(
-    os.environ.get("TOPOLI_STATE_DIR", Path.home() / ".local/state/automated-topoli")
-)
+STATE_DIR = Path(os.environ.get("TOPOLI_STATE_DIR", Path.home() / ".local/state/automated-topoli"))
 
 # api_id/api_hash identify the *application*, not the account: they cannot log
 # anyone in without the phone, the code and the 2FA password, so they live in
@@ -143,9 +141,7 @@ def proxy() -> tuple[str, str, int] | None:
     if not url:
         return None
     parsed = urlparse(url if "://" in url else f"http://{url}")
-    scheme = {"socks5h": "socks5", "socks4a": "socks4"}.get(
-        parsed.scheme, parsed.scheme
-    )
+    scheme = {"socks5h": "socks5", "socks4a": "socks4"}.get(parsed.scheme, parsed.scheme)
     if scheme not in ("http", "socks4", "socks5"):
         die(f"unsupported proxy scheme {parsed.scheme!r} in {url!r}")
     if not parsed.hostname or not parsed.port:
@@ -173,7 +169,7 @@ def open_session() -> SQLiteSession:
     text, source = found
     try:
         repo = StringSession(text)
-    except (ValueError, struct.error, binascii.Error):
+    except ValueError, struct.error, binascii.Error:
         die(f"{source} does not hold a valid telethon session string")
     if not repo.auth_key or repo.auth_key.key == getattr(sess.auth_key, "key", None):
         return sess
@@ -185,7 +181,7 @@ def open_session() -> SQLiteSession:
     SESSION.unlink(missing_ok=True)
     sess = SQLiteSession(str(SESSION.with_suffix("")))
     sess.set_dc(repo.dc_id, repo.server_address, repo.port)  # this re-reads the
-    sess.auth_key = repo.auth_key                            # key, so it is first
+    sess.auth_key = repo.auth_key  # key, so it is first
     sess.save()
     return sess
 
@@ -263,7 +259,6 @@ def bot_api_variants(raw: int) -> list[int]:
     return out
 
 
-
 # --------------------------------------------------------------------------
 # message formatting
 # --------------------------------------------------------------------------
@@ -276,8 +271,7 @@ def _utf16_len(text: str) -> int:
     return len(text.encode("utf-16-le")) // 2
 
 
-def build_message(raw: str, parse: str = "markdown", quote: bool = False,
-                  expandable: bool = False):
+def build_message(raw: str, parse: str = "markdown", quote: bool = False, expandable: bool = False):
     """Turn raw text into (text, entities) for send_message.
 
     parse: 'markdown' (default; bold ** italic __ strike ~~ code ` pre ``` link
@@ -297,9 +291,7 @@ def build_message(raw: str, parse: str = "markdown", quote: bool = False,
         die(f"unknown parse mode {parse!r}; pick one of {', '.join(PARSE_CHOICES)}")
     entities = list(entities)
     if quote or expandable:
-        entities.append(
-            MessageEntityBlockquote(0, _utf16_len(text), collapsed=bool(expandable))
-        )
+        entities.append(MessageEntityBlockquote(0, _utf16_len(text), collapsed=bool(expandable)))
     return text, entities
 
 
@@ -307,6 +299,7 @@ def format_summary(entities) -> str:
     if not entities:
         return "plain"
     from collections import Counter
+
     c = Counter(type(e).__name__.replace("MessageEntity", "") for e in entities)
     return ", ".join(f"{k}x{v}" if v > 1 else k for k, v in c.items())
 
@@ -319,7 +312,7 @@ def format_summary(entities) -> str:
 def load_index() -> dict:
     try:
         return json.loads(INDEX_FILE.read_text())
-    except (OSError, ValueError):
+    except OSError, ValueError:
         return {}
 
 
@@ -345,9 +338,7 @@ def index_lookup(name: str):
     substring). Empty list if the cache has no hit."""
     name = name.lower().lstrip("@")
     rows = load_index().values()
-    exact = [r["id"] for r in rows
-             if r.get("title", "").lower() == name
-             or (r.get("username") or "").lower() == name]
+    exact = [r["id"] for r in rows if r.get("title", "").lower() == name or (r.get("username") or "").lower() == name]
     if exact:
         return exact
     return [r["id"] for r in rows if name in r.get("title", "").lower()]
@@ -399,7 +390,7 @@ async def resolve(cli, ref: str):
                 ent = await cli.get_entity(ids[0])
                 index_put(ent)
                 return ent
-            except (ValueError, errors.RPCError):
+            except ValueError, errors.RPCError:
                 pass
         elif len(ids) > 1:
             rows = load_index()
@@ -421,7 +412,7 @@ async def resolve(cli, ref: str):
             ent = await cli.get_entity(candidate)
             index_put(ent)
             return ent
-        except (ValueError, errors.RPCError):
+        except ValueError, errors.RPCError:
             continue
 
     # Telethon can only resolve a bare id it has seen before, so walk the
@@ -516,10 +507,14 @@ async def cmd_login(cli, args) -> None:
     if phone and not args.code:
         sent = await cli.send_code_request(phone)
         STATE_DIR.mkdir(parents=True, exist_ok=True)
-        PENDING.write_text(json.dumps({
-            "phone": phone,
-            "phone_code_hash": sent.phone_code_hash,
-        }))
+        PENDING.write_text(
+            json.dumps(
+                {
+                    "phone": phone,
+                    "phone_code_hash": sent.phone_code_hash,
+                }
+            )
+        )
         PENDING.chmod(0o600)
         print(f"code sent to {phone} (check Telegram, not SMS)")
         print("then run:  uv run topoli_user.py login --code <code>")
@@ -582,8 +577,10 @@ async def cmd_chats(cli, args) -> None:
     async for dialog in cli.iter_dialogs(limit=args.limit):
         ent = dialog.entity
         rows[str(ent.id)] = {
-            "id": ent.id, "title": label(ent),
-            "username": getattr(ent, "username", None), "kind": kind(ent),
+            "id": ent.id,
+            "title": label(ent),
+            "username": getattr(ent, "username", None),
+            "kind": kind(ent),
         }
         if args.unread and not dialog.unread_count:
             continue
@@ -633,8 +630,7 @@ async def cmd_send(cli, args) -> None:
     print("about to send")
     print("  as     : your own account — indistinguishable from you typing it")
     print(f"  chat   : {label(entity)} ({kind(entity)}, id={entity.id})")
-    print(f"  parse  : {args.parse}{'  +quote' if args.quote else ''}"
-          f"{'  (expandable)' if args.expandable else ''}")
+    print(f"  parse  : {args.parse}{'  +quote' if args.quote else ''}{'  (expandable)' if args.expandable else ''}")
     print(f"  format : {format_summary(entities)}")
     print(f"  text   : {text}")
 
@@ -642,9 +638,7 @@ async def cmd_send(cli, args) -> None:
         print("\nDRY RUN — nothing sent. Re-run with --yes to actually deliver.")
         return
 
-    msg = await cli.send_message(
-        entity, text, formatting_entities=entities or None, reply_to=args.reply_to
-    )
+    msg = await cli.send_message(entity, text, formatting_entities=entities or None, reply_to=args.reply_to)
     print(f"sent: message_id={msg.id} at {ts(msg.date)}")
 
 
@@ -667,9 +661,7 @@ async def cmd_create_group(cli, args) -> None:
         print("\nDRY RUN — nothing created. Re-run with --yes to actually create it.")
         return
 
-    res = await cli(
-        CreateChannelRequest(title=args.title, about=args.about or "", megagroup=True)
-    )
+    res = await cli(CreateChannelRequest(title=args.title, about=args.about or "", megagroup=True))
     chat = res.chats[0]
     print(f"created: {chat.title} (supergroup, id={chat.id})")
     print(f"  bot-API id for topoli.py would be: -100{chat.id}")
@@ -709,8 +701,7 @@ async def cmd_react(cli, args) -> None:
     try:
         await cli(SendReactionRequest(peer=entity, msg_id=args.message, reaction=reaction))  # ty: ignore[invalid-argument-type]
     except errors.ReactionInvalidError:
-        die(f"{args.emoji!r} is not an allowed reaction in this chat — "
-            "groups can restrict which emoji are available")
+        die(f"{args.emoji!r} is not an allowed reaction in this chat — groups can restrict which emoji are available")
     print(f"reacted: {'cleared' if args.remove else args.emoji} on message {args.message}")
 
 
@@ -726,8 +717,9 @@ async def cmd_send_file(cli, args) -> None:
     print(f"  chat  : {label(entity)} ({kind(entity)}, id={entity.id})")
     for p in paths:
         print(f"  file  : {p}  ({p.stat().st_size / 1024 / 1024:.1f} MB)")
-    cap_text, cap_entities = (build_message(
-        args.caption, args.parse, args.quote, args.expandable) if args.caption else ("", []))
+    cap_text, cap_entities = (
+        build_message(args.caption, args.parse, args.quote, args.expandable) if args.caption else ("", [])
+    )
     if args.caption:
         print(f"  caption: {cap_text}  [{args.parse}{'  +quote' if args.quote else ''}]")
 
@@ -803,10 +795,7 @@ async def cmd_folders(cli, args) -> None:
     if args.chat:
         entity = await resolve(cli, args.chat)
         target = utils.get_peer_id(entity)
-        holding = [
-            f for f in filters
-            if any(utils.get_peer_id(p) == target for p in filter_peers(f))
-        ]
+        holding = [f for f in filters if any(utils.get_peer_id(p) == target for p in filter_peers(f))]
         print(f"{label(entity)} ({kind(entity)}, id={entity.id})")
         for f in holding:
             print(f"  {filter_title(f)}  (id={f.id}, colour {f.color})")
@@ -926,17 +915,14 @@ async def cmd_tags(cli, args) -> None:
 
 
 def build_parser() -> argparse.ArgumentParser:
-    p = argparse.ArgumentParser(
-        prog="topoli_user.py", description=__doc__.splitlines()[0]
-    )
+    p = argparse.ArgumentParser(prog="topoli_user.py", description=__doc__.splitlines()[0])
     sub = p.add_subparsers(dest="cmd", required=True)
 
     sp = sub.add_parser("setup", help="store api_id/api_hash from my.telegram.org")
     sp.add_argument("--api-id", required=True)
     sp.add_argument("--api-hash", required=True)
     sp.add_argument("--phone", help="phone in international form, stored for login")
-    sp.add_argument("--local", action="store_true",
-                    help="write to the machine-local state dir instead of the repo")
+    sp.add_argument("--local", action="store_true", help="write to the machine-local state dir instead of the repo")
     sp.set_defaults(fn=cmd_setup, offline=True)
 
     sp = sub.add_parser("login", help="first-time login: --phone, then --code")
@@ -965,11 +951,11 @@ def build_parser() -> argparse.ArgumentParser:
     sp = sub.add_parser("send", help="send a message as yourself")
     sp.add_argument("--chat", required=True, help="@username, t.me link, numeric id, or chat title")
     sp.add_argument("--text", required=True)
-    sp.add_argument("--parse", default="markdown", choices=PARSE_CHOICES,
-                    help="text markup: markdown (default), html, or none")
+    sp.add_argument(
+        "--parse", default="markdown", choices=PARSE_CHOICES, help="text markup: markdown (default), html, or none"
+    )
     sp.add_argument("--quote", action="store_true", help="wrap the whole message in a blockquote")
-    sp.add_argument("--expandable", action="store_true",
-                    help="collapsed tap-to-expand blockquote (implies --quote)")
+    sp.add_argument("--expandable", action="store_true", help="collapsed tap-to-expand blockquote (implies --quote)")
     sp.add_argument("--reply-to", type=int)
     sp.add_argument("--yes", action="store_true", help="actually send (otherwise dry run)")
     sp.set_defaults(fn=cmd_send)
@@ -1000,8 +986,9 @@ def build_parser() -> argparse.ArgumentParser:
     sp.add_argument("--name", required=True, help="folder title, or its numeric id")
     sp.add_argument("--add", action="append", help="chat to tag with it; repeatable")
     sp.add_argument("--remove", action="append", help="chat to drop from it; repeatable")
-    sp.add_argument("--color", type=int, choices=range(-1, 7), metavar="-1..6",
-                    help="recolour the chip (-1 clears the colour)")
+    sp.add_argument(
+        "--color", type=int, choices=range(-1, 7), metavar="-1..6", help="recolour the chip (-1 clears the colour)"
+    )
     sp.add_argument("--yes", action="store_true", help="actually apply (otherwise dry run)")
     sp.set_defaults(fn=cmd_folder)
 
@@ -1015,8 +1002,9 @@ def build_parser() -> argparse.ArgumentParser:
     sp.add_argument("--chat", required=True, help="@username, t.me link, numeric id, or chat title")
     sp.add_argument("--file", action="append", required=True, help="repeat for several")
     sp.add_argument("--caption")
-    sp.add_argument("--parse", default="markdown", choices=PARSE_CHOICES,
-                    help="caption markup: markdown (default), html, or none")
+    sp.add_argument(
+        "--parse", default="markdown", choices=PARSE_CHOICES, help="caption markup: markdown (default), html, or none"
+    )
     sp.add_argument("--quote", action="store_true", help="wrap the caption in a blockquote")
     sp.add_argument("--expandable", action="store_true", help="collapsed blockquote (implies --quote)")
     sp.add_argument("--photo", action="store_true", help="send as photo (recompressed) not document")

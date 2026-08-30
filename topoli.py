@@ -29,9 +29,7 @@ from typing import NoReturn
 API = "https://api.telegram.org"
 
 SKILL_DIR = Path(__file__).resolve().parent
-STATE_DIR = Path(
-    os.environ.get("TOPOLI_STATE_DIR", Path.home() / ".local/state/automated-topoli")
-)
+STATE_DIR = Path(os.environ.get("TOPOLI_STATE_DIR", Path.home() / ".local/state/automated-topoli"))
 STATE_FILE = STATE_DIR / "state.json"
 LOG_FILE = STATE_DIR / "messages.jsonl"
 
@@ -123,8 +121,7 @@ def encode_multipart(fields: dict, files: dict) -> tuple[bytes, str]:
         ctype = mimetypes.guess_type(path.name)[0] or "application/octet-stream"
         body += sep
         body += (
-            f'Content-Disposition: form-data; name="{key}"; filename="{name}"\r\n'
-            f"Content-Type: {ctype}\r\n\r\n"
+            f'Content-Disposition: form-data; name="{key}"; filename="{name}"\r\nContent-Type: {ctype}\r\n\r\n'
         ).encode()
         body += path.read_bytes() + b"\r\n"
 
@@ -132,8 +129,7 @@ def encode_multipart(fields: dict, files: dict) -> tuple[bytes, str]:
     return bytes(body), f"multipart/form-data; boundary={boundary}"
 
 
-def call(method: str, params: dict | None = None, timeout: int = 30,
-         files: dict | None = None) -> dict:
+def call(method: str, params: dict | None = None, timeout: int = 30, files: dict | None = None) -> dict:
     url = f"{API}/bot{token()}/{method}"
     data = None
     headers = {}
@@ -202,8 +198,17 @@ def body(msg: dict) -> str:
 
 def media_kind(msg: dict) -> str:
     for key in (
-        "photo", "video", "voice", "audio", "document", "sticker",
-        "animation", "video_note", "contact", "location", "poll",
+        "photo",
+        "video",
+        "voice",
+        "audio",
+        "document",
+        "sticker",
+        "animation",
+        "video_note",
+        "contact",
+        "location",
+        "poll",
     ):
         if key in msg:
             return key
@@ -259,9 +264,7 @@ def cmd_whoami(args) -> None:
     me = call("getMe")
     print(f"bot        : {me.get('first_name')} (@{me.get('username')})  id={me.get('id')}")
     group_reads = (
-        "all messages"
-        if me.get("can_read_all_group_messages")
-        else "mentions/commands only (privacy mode ON)"
+        "all messages" if me.get("can_read_all_group_messages") else "mentions/commands only (privacy mode ON)"
     )
     print(f"group reads: {group_reads}")
 
@@ -308,10 +311,7 @@ def cmd_poll(args) -> None:
             if "business_connection" in upd:
                 conn = upd["business_connection"]
                 state.setdefault("connections", {})[conn["id"]] = conn
-                print(
-                    f"[connection] {who(conn.get('user'))} "
-                    f"{'enabled' if conn.get('is_enabled') else 'DISABLED'}"
-                )
+                print(f"[connection] {who(conn.get('user'))} {'enabled' if conn.get('is_enabled') else 'DISABLED'}")
                 continue
 
             key = next(
@@ -326,10 +326,7 @@ def cmd_poll(args) -> None:
             # Plain `message` updates carry no business_connection_id, so fall
             # back to every account we hold a connection for. Without this, a
             # message Parham sent himself in a group is rendered as incoming.
-            owners = {
-                c.get("user", {}).get("id")
-                for c in state.get("connections", {}).values()
-            }
+            owners = {c.get("user", {}).get("id") for c in state.get("connections", {}).values()}
             owners.discard(None)
             owner = None
             if conn_id and conn_id in state.get("connections", {}):
@@ -547,11 +544,11 @@ def main() -> None:
 
     sp = sub.add_parser("send-file", help="upload files to a chat (as Parham by default)")
     sp.add_argument("--chat", required=True, help="chat_id or @username")
-    sp.add_argument("--file", required=True, action="append",
-                    help="path to send; repeat for several, sent in order")
+    sp.add_argument("--file", required=True, action="append", help="path to send; repeat for several, sent in order")
     sp.add_argument("--caption", help="caption, applied to the first file only")
-    sp.add_argument("--photo", action="store_true",
-                    help="send as a photo instead of a document (recompressed by Telegram)")
+    sp.add_argument(
+        "--photo", action="store_true", help="send as a photo instead of a document (recompressed by Telegram)"
+    )
     sp.add_argument("--reply-to", type=int, help="message_id to reply to")
     sp.add_argument("--as-bot", action="store_true", help="send as the bot instead of as Parham")
     sp.add_argument("--delay", type=float, default=1.0, help="seconds between files (default 1)")
