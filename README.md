@@ -35,6 +35,6 @@ uv run ruff check .
 uv run ty check .
 ```
 
-`ruff` lints and `ty` type-checks; both run in CI on every push and pull request. The project targets Python 3.14.
+`ruff` lints and `ty` type-checks; both run in CI on every push and pull request. The project targets Python 3.14, so it leans on what that release added — annotations are lazy by default (PEP 649), and `except` takes an unparenthesised list of exception types (PEP 758).
 
 Telethon's development moved off GitHub in February 2026: <https://github.com/LonamiWebs/Telethon> is archived and read-only, and the live repository is now <https://codeberg.org/Lonami/Telethon>. The PyPI package name is unchanged, so nothing here depends on the move beyond the link.
