@@ -11,11 +11,11 @@ Parham's own account over MTProto, the same protocol the desktop client speaks,
 so it can read any chat backwards and send as him — with no poller and no
 server.
 
-The price is `topoli.authkey`. It is a bearer credential for the whole account
-that does not re-prompt for 2FA, and it is committed at Parham's explicit
-instruction so that every clone of this repo is already logged in. Understand
-what that means before copying the pattern: anyone who can read the repo can
-act as him on Telegram, and git history keeps the key forever.
+The price is the auth key. It is a bearer credential for the whole account that
+does not re-prompt for 2FA: whoever holds it is logged in as Parham, and git
+history would keep it forever. It therefore lives outside this repository —
+`TOPOLI_SESSION_STRING`, or a `*.authkey` file that `.gitignore` blocks — in a
+private store alongside `api.json`.
 
 Dependencies are declared inline (PEP 723): `uv run topoli_user.py ...` installs
 telethon on first use and needs no venv of its own.
@@ -72,22 +72,22 @@ CONFIG_FILE = STATE_DIR / "user.json"
 INDEX_FILE = STATE_DIR / "chat-index.json"  # cached title->id map for fast resolve
 PENDING = STATE_DIR / "login-pending.json"
 
-# The credential is split from the cache, and only the credential is committed.
+# The credential is split from the cache, and neither is committed here.
 #
 # `topoli.authkey` is a telethon session string: one stable ~350-byte line
 # holding the dc, its address and the auth key — everything, and only what, it
-# takes to be logged in. Committing it is the whole point: a clone of this repo
-# can read and send as Parham with no phone, no code and no 2FA prompt.
+# takes to be logged in. That one line is the whole login, which is exactly why
+# it is a password and why `.gitignore` blocks it.
 #
 # `topoli.session` is telethon's SQLite session — the same auth key plus a cache
 # of entity access-hashes and per-chat pts counters. Telethon restamps every
-# cached entity with `int(time.time())` on every run, so committing that file
-# rewrote ~141 identical rows in each diff for no information at all. It is
-# rebuilt from the authkey on demand and lives in the state directory instead,
+# cached entity with `int(time.time())` on every run, so keeping it under version
+# control rewrote ~141 identical rows in each diff for no information at all. It
+# is rebuilt from the authkey on demand and lives in the state directory instead,
 # where it can churn freely.
 #
-# TOPOLI_SESSION moves the cache; TOPOLI_SESSION_STRING supplies a different
-# credential without touching the repo.
+# TOPOLI_SESSION moves the cache; TOPOLI_SESSION_STRING supplies the credential
+# straight from the environment, with no file on disk at all.
 SESSION = Path(os.environ.get("TOPOLI_SESSION", STATE_DIR / "topoli.session"))
 SESSION_STRING = SKILL_DIR / "topoli.authkey"
 
@@ -149,7 +149,7 @@ def proxy() -> tuple[str, str, int] | None:
 
 
 def session_string() -> tuple[str, str] | None:
-    """The committed auth key, unless the environment overrides it."""
+    """The stored auth key, unless the environment overrides it."""
     raw = os.environ.get("TOPOLI_SESSION_STRING")
     source = "TOPOLI_SESSION_STRING"
     if raw is None and SESSION_STRING.is_file():
@@ -158,13 +158,13 @@ def session_string() -> tuple[str, str] | None:
 
 
 def open_session() -> SQLiteSession:
-    """Build the local SQLite cache, seeding it from the committed auth key."""
+    """Build the local SQLite cache, seeding it from the stored auth key."""
     STATE_DIR.mkdir(parents=True, exist_ok=True)
     sess = SQLiteSession(str(SESSION.with_suffix("")))
 
     found = session_string()
     if not found:
-        return sess  # nothing committed yet — `login` will create it
+        return sess  # nothing stored yet — `login` will create it
     text, source = found
     try:
         repo = StringSession(text)
@@ -191,7 +191,7 @@ def client() -> TelegramClient:
 
 
 def export_session(cli) -> None:
-    """Persist the auth key to the repo so every clone is logged in."""
+    """Persist the auth key beside the script so later runs skip the login."""
     text = StringSession.save(cli.session)
     if not text:
         return
@@ -494,7 +494,7 @@ async def cmd_login(cli, args) -> None:
         me = await cli.get_me()
         print(f"logged in as {label(me)}  id={me.id}")
         print(f"auth key written to {SESSION_STRING}")
-        print("commit it to log every clone of this repo in — it is a password")
+        print("treat it as a password: it logs anyone holding it in as you, with no 2FA")
         return
 
     phone = args.phone or load_config().get("phone")
@@ -552,7 +552,7 @@ async def cmd_login(cli, args) -> None:
     me = await cli.get_me()
     print(f"logged in as {label(me)}  id={me.id}")
     print(f"auth key written to {SESSION_STRING}")
-    print("commit it to log every clone of this repo in — it is a password")
+    print("treat it as a password: it logs anyone holding it in as you, with no 2FA")
 
 
 async def cmd_whoami(cli, args) -> None:
@@ -561,7 +561,7 @@ async def cmd_whoami(cli, args) -> None:
     print(f"id      : {me.id}")
     print(f"phone   : +{me.phone}" if me.phone else "phone   : hidden")
     print(f"premium : {getattr(me, 'premium', False)}")
-    print(f"auth key: {SESSION_STRING} (committed)")
+    print(f"auth key: {SESSION_STRING} (secret — never commit)")
     print(f"cache   : {SESSION} (local, disposable)")
 
 
