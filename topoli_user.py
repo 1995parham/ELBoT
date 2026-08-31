@@ -21,8 +21,6 @@ Dependencies are declared inline (PEP 723): `uv run topoli_user.py ...` installs
 telethon on first use and needs no venv of its own.
 """
 
-from __future__ import annotations
-
 import argparse
 import asyncio
 import binascii
@@ -31,6 +29,7 @@ import json
 import os
 import struct
 import sys
+from collections import Counter
 from datetime import UTC, datetime
 from pathlib import Path
 from typing import NoReturn
@@ -298,8 +297,6 @@ def build_message(raw: str, parse: str = "markdown", quote: bool = False, expand
 def format_summary(entities) -> str:
     if not entities:
         return "plain"
-    from collections import Counter
-
     c = Counter(type(e).__name__.replace("MessageEntity", "") for e in entities)
     return ", ".join(f"{k}x{v}" if v > 1 else k for k, v in c.items())
 
