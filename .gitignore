@@ -1,6 +1,8 @@
 # --- credentials: never commit these; they live in the private keys repo ---
 api.json
 token
+# not a credential, but it maps names to the real people you talk to
+aliases.json
 *.authkey
 *.session
 *.session-journal

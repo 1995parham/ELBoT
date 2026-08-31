@@ -72,6 +72,14 @@ CONFIG_FILE = STATE_DIR / "user.json"
 INDEX_FILE = STATE_DIR / "chat-index.json"  # cached title->id map for fast resolve
 PENDING = STATE_DIR / "login-pending.json"
 
+# "wife" is not a Telegram concept, and two contacts can share a display name,
+# so a title lookup alone cannot settle who is meant. The alias book is the
+# answer to that: a hand-written name -> id map that resolves before anything
+# else and never goes ambiguous. It sits beside api.json (so it travels with the
+# private repo, to every machine) with a machine-local override in the state dir.
+ALIAS_REPO = SKILL_DIR / "aliases.json"
+ALIAS_LOCAL = STATE_DIR / "aliases.json"
+
 # The credential is split from the cache, and neither is committed here.
 #
 # `topoli.authkey` is a telethon session string: one stable ~350-byte line
@@ -110,6 +118,31 @@ def load_config() -> dict:
             with contextlib.suppress(json.JSONDecodeError):
                 cfg.update(json.loads(path.read_text()))
     return cfg
+
+
+def read_json(path: Path) -> dict:
+    """Whatever the file holds, or {} if it is missing or not valid JSON."""
+    if not path.is_file():
+        return {}
+    with contextlib.suppress(json.JSONDecodeError, OSError):
+        return json.loads(path.read_text())
+    return {}
+
+
+def load_aliases() -> dict:
+    """The merged alias book, keyed lowercase so lookups are case-insensitive."""
+    out: dict = {}
+    for path in (ALIAS_REPO, ALIAS_LOCAL):  # later wins
+        out.update({str(k).lower(): v for k, v in read_json(path).items()})
+    return out
+
+
+def save_aliases(rows: dict, local: bool) -> Path:
+    path = ALIAS_LOCAL if local else ALIAS_REPO
+    if local:
+        STATE_DIR.mkdir(parents=True, exist_ok=True)
+    path.write_text(json.dumps(rows, ensure_ascii=False, indent=2, sort_keys=True) + "\n")
+    return path
 
 
 def credentials() -> tuple[int, str]:
@@ -210,6 +243,29 @@ def secure_session() -> None:
 # --------------------------------------------------------------------------
 
 
+def emit(rows, args) -> bool:
+    """Print rows as JSON if --json was asked for; report whether it did.
+
+    Every read command ends with `if emit(...): return`, so the human format
+    below it stays the readable default and the machine format is one flag away.
+    """
+    if not getattr(args, "json", False):
+        return False
+    print(json.dumps(rows, ensure_ascii=False, indent=2, default=str))
+    return True
+
+
+def parse_when(text: str | None, flag: str) -> datetime | None:
+    """An ISO date or datetime, read as local time unless it carries an offset."""
+    if not text:
+        return None
+    try:
+        dt = datetime.fromisoformat(text)
+    except ValueError:
+        die(f"{flag} wants an ISO date like 2026-08-01 or 2026-08-01T14:30, got {text!r}")
+    return dt.astimezone(UTC)  # a naive value is taken as this machine's local time
+
+
 def ts(dt: datetime | None) -> str:
     if not dt:
         return "?"
@@ -239,6 +295,16 @@ def kind(entity) -> str:
     if isinstance(entity, Channel):
         return "supergroup" if getattr(entity, "megagroup", False) else "channel"
     return "?"
+
+
+def entity_row(entity) -> dict:
+    """One chat flattened the same way everywhere: the index, `chats`, --json."""
+    return {
+        "id": entity.id,
+        "title": label(entity),
+        "username": getattr(entity, "username", None),
+        "kind": kind(entity),
+    }
 
 
 def bot_api_variants(raw: int) -> list[int]:
@@ -321,12 +387,7 @@ def save_index(rows: dict) -> None:
 def index_put(entity) -> None:
     """Record one entity in the cache under its current title/username."""
     rows = load_index()
-    rows[str(entity.id)] = {
-        "id": entity.id,
-        "title": label(entity),
-        "username": getattr(entity, "username", None),
-        "kind": kind(entity),
-    }
+    rows[str(entity.id)] = entity_row(entity)
     save_index(rows)
 
 
@@ -351,12 +412,7 @@ async def refresh_index(cli):
     async for dialog in cli.iter_dialogs():
         e = dialog.entity
         ents.append(e)
-        rows[str(e.id)] = {
-            "id": e.id,
-            "title": label(e),
-            "username": getattr(e, "username", None),
-            "kind": kind(e),
-        }
+        rows[str(e.id)] = entity_row(e)
     save_index(rows)
     return ents
 
@@ -368,6 +424,12 @@ async def resolve(cli, ref: str):
     ref = ref.strip()
     if not ref:
         die("empty chat reference")
+
+    # An alias wins over everything: it exists precisely to name a chat that
+    # @username, id and title all fail to pin down unambiguously.
+    hit = load_aliases().get(ref.lower())
+    if hit is not None:
+        ref = str(hit["id"] if isinstance(hit, dict) else hit)
 
     if not ref.lstrip("-").isdigit():
         if ref.lower() in ("me", "self", "saved"):
@@ -420,6 +482,17 @@ async def resolve(cli, ref: str):
             return e
 
     die(f"no chat with id {ref}. Bot API ids differ from MTProto ids — run `chats` and use the id printed there.")
+
+
+def msg_row(msg, me_id=None) -> dict:
+    """One message flattened for --json, mirroring what the text format prints."""
+    return {
+        "id": msg.id,
+        "date": ts(msg.date),
+        "outgoing": msg.sender_id == me_id,
+        "sender_id": msg.sender_id,
+        "text": body(msg),
+    }
 
 
 def body(msg) -> str:
@@ -570,12 +643,7 @@ async def cmd_chats(cli, args) -> None:
     rows = {}
     async for dialog in cli.iter_dialogs(limit=args.limit):
         ent = dialog.entity
-        rows[str(ent.id)] = {
-            "id": ent.id,
-            "title": label(ent),
-            "username": getattr(ent, "username", None),
-            "kind": kind(ent),
-        }
+        rows[str(ent.id)] = entity_row(ent)
         if args.unread and not dialog.unread_count:
             continue
         flag = f"  [{dialog.unread_count} unread]" if dialog.unread_count else ""
@@ -634,6 +702,45 @@ async def cmd_send(cli, args) -> None:
 
     msg = await cli.send_message(entity, text, formatting_entities=entities or None, reply_to=args.reply_to)
     print(f"sent: message_id={msg.id} at {ts(msg.date)}")
+
+
+async def cmd_alias(cli, args) -> None:
+    """Name a chat once, address it by that name forever.
+
+    `--set` resolves the reference now and stores the numeric id, not the text:
+    a display name can be shared by two contacts and a username can be given up
+    and re-registered by somebody else, but the id is the account.
+    """
+    if args.remove:
+        for target in (ALIAS_REPO, ALIAS_LOCAL):
+            rows = {k.lower(): v for k, v in read_json(target).items()}
+            if rows.pop(args.remove.lower(), None) is not None:
+                save_aliases(rows, local=target is ALIAS_LOCAL)
+                print(f"removed alias {args.remove!r} from {target}")
+                return
+        die(f"no alias called {args.remove!r}")
+
+    if args.set:
+        name, ref = args.set
+        entity = await resolve(cli, ref)
+        target = ALIAS_LOCAL if args.local else ALIAS_REPO
+        rows = {k.lower(): v for k, v in read_json(target).items()}
+        rows[name.lower()] = {"id": entity.id, "label": label(entity), "kind": kind(entity)}
+        save_aliases(rows, args.local)
+        print(f"{name} -> {label(entity)} ({kind(entity)}, id={entity.id})")
+        print(f"stored in {target}")
+        return
+
+    rows = load_aliases()
+    listing = [
+        {"alias": k, **(v if isinstance(v, dict) else {"id": v, "label": "?", "kind": "?"})}
+        for k, v in sorted(rows.items())
+    ]
+    if emit(listing, args):
+        return
+    for r in listing:
+        print(f"{r['alias']:<16} {r['id']:>16}  {r.get('label', '?')}")
+    print(f"\n-- {len(listing)} alias(es); {ALIAS_REPO} + {ALIAS_LOCAL}", file=sys.stderr)
 
 
 async def cmd_create_group(cli, args) -> None:
@@ -908,6 +1015,11 @@ async def cmd_tags(cli, args) -> None:
 # --------------------------------------------------------------------------
 
 
+def add_json(sp):
+    sp.add_argument("--json", action="store_true", help="machine-readable output instead of the text format")
+    return sp
+
+
 def build_parser() -> argparse.ArgumentParser:
     p = argparse.ArgumentParser(prog="topoli_user.py", description=__doc__.splitlines()[0])
     sub = p.add_subparsers(dest="cmd", required=True)
@@ -930,6 +1042,12 @@ def build_parser() -> argparse.ArgumentParser:
     sp.add_argument("--limit", type=int, default=50)
     sp.add_argument("--unread", action="store_true", help="only chats with unread messages")
     sp.set_defaults(fn=cmd_chats)
+
+    sp = add_json(sub.add_parser("alias", help="name a chat once, address it by that name forever"))
+    sp.add_argument("--set", nargs=2, metavar=("NAME", "CHAT"), help="e.g. --set wife @someone")
+    sp.add_argument("--remove", metavar="NAME")
+    sp.add_argument("--local", action="store_true", help="store in the state dir instead of beside the script")
+    sp.set_defaults(fn=cmd_alias)
 
     sp = sub.add_parser("history", help="read a chat backwards — the thing bots cannot do")
     sp.add_argument("--chat", required=True, help="id, @username, or t.me link")
