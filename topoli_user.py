@@ -5,11 +5,11 @@
 # ///
 """Automated Topoli — user-account mode (MTProto via Telethon).
 
-The sibling `topoli.py` drives a *bot*, which the Telegram Bot API only ever
-lets receive an event stream: it cannot read history, and it must be listening
-when a message arrives. This one logs in as Parham's own account over MTProto,
-the same protocol the desktop client speaks, so it can read any chat backwards
-and send as him — with no poller and no server.
+The Telegram Bot API only ever lets a bot receive an event stream: it cannot
+read history, and it must be listening when a message arrives. This logs in as
+Parham's own account over MTProto, the same protocol the desktop client speaks,
+so it can read any chat backwards and send as him — with no poller and no
+server.
 
 The price is `topoli.authkey`. It is a bearer credential for the whole account
 that does not re-prompt for 2FA, and it is committed at Parham's explicit
@@ -245,9 +245,9 @@ def bot_api_variants(raw: int) -> list[int]:
     """Bot API chat ids are not MTProto ids; offer the plausible translations.
 
     A bot-side group reads as -5446268647 while MTProto calls the same chat
-    5446268647, and a supergroup carries an extra -100 prefix. Ids copied from
-    `topoli.py` therefore fail a naive lookup, so try the conversions rather
-    than making that the user's problem.
+    5446268647, and a supergroup carries an extra -100 prefix. An id copied out
+    of a bot therefore fails a naive lookup, so try the conversions rather than
+    making that the user's problem.
     """
     out = [raw]
     if raw < 0:
@@ -419,10 +419,7 @@ async def resolve(cli, ref: str):
         if abs(e.id) in wanted:
             return e
 
-    die(
-        f"no chat with id {ref}. Ids from topoli.py (Bot API) differ from "
-        "MTProto ids — run `chats` and use the id printed there."
-    )
+    die(f"no chat with id {ref}. Bot API ids differ from MTProto ids — run `chats` and use the id printed there.")
 
 
 def body(msg) -> str:
@@ -661,7 +658,7 @@ async def cmd_create_group(cli, args) -> None:
     res = await cli(CreateChannelRequest(title=args.title, about=args.about or "", megagroup=True))
     chat = res.chats[0]
     print(f"created: {chat.title} (supergroup, id={chat.id})")
-    print(f"  bot-API id for topoli.py would be: -100{chat.id}")
+    print(f"  Bot API id for the same chat: -100{chat.id}")
 
 
 async def cmd_react(cli, args) -> None:
