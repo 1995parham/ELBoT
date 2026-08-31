@@ -1,6 +1,6 @@
 # elbot
 
-A personal Telegram secretary that logs in as the account itself over MTProto (via [Telethon](https://github.com/LonamiWebs/Telethon)) — so it can read any chat backwards, search the whole archive, see every group and channel, send as the user with full markdown/HTML/quote formatting, upload files, react, mark chats read, and manage folders.
+A personal Telegram secretary that logs in as the account itself over MTProto (via [Telethon](https://codeberg.org/Lonami/Telethon)) — so it can read any chat backwards, search the whole archive, see every group and channel, send as the user with full markdown/HTML/quote formatting, upload files, react, mark chats read, and manage folders.
 
 ## Running
 
@@ -36,3 +36,5 @@ uv run ty check .
 ```
 
 `ruff` lints and `ty` type-checks; both run in CI on every push and pull request. The project targets Python 3.14.
+
+Telethon's development moved off GitHub in February 2026: <https://github.com/LonamiWebs/Telethon> is archived and read-only, and the live repository is now <https://codeberg.org/Lonami/Telethon>. The PyPI package name is unchanged, so nothing here depends on the move beyond the link.
