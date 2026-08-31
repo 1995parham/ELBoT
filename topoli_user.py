@@ -640,33 +640,54 @@ async def cmd_whoami(cli, args) -> None:
 
 
 async def cmd_chats(cli, args) -> None:
-    n = 0
-    rows = {}
+    rows, shown = {}, []
     async for dialog in cli.iter_dialogs(limit=args.limit):
         ent = dialog.entity
         rows[str(ent.id)] = entity_row(ent)
         if args.unread and not dialog.unread_count:
             continue
-        flag = f"  [{dialog.unread_count} unread]" if dialog.unread_count else ""
-        print(f"{ent.id:>16}  {label(ent)}  ({kind(ent)}){flag}")
-        if dialog.message:
-            print(f"                  last {ts(dialog.message.date)}: {body(dialog.message)[:100]}")
-        n += 1
+        shown.append(
+            {
+                **entity_row(ent),
+                "unread": dialog.unread_count,
+                "last_date": ts(dialog.message.date) if dialog.message else None,
+                "last_text": body(dialog.message) if dialog.message else None,
+            }
+        )
     if rows:  # keep the fast title->id cache current for `send --chat <name>`
         save_index({**load_index(), **rows})
-    print(f"\n-- {n} chat(s); cache: {INDEX_FILE}", file=sys.stderr)
+
+    if emit(shown, args):
+        return
+    for r in shown:
+        flag = f"  [{r['unread']} unread]" if r["unread"] else ""
+        print(f"{r['id']:>16}  {r['title']}  ({r['kind']}){flag}")
+        if r["last_date"]:
+            print(f"                  last {r['last_date']}: {(r['last_text'] or '')[:100]}")
+    print(f"\n-- {len(shown)} chat(s); cache: {INDEX_FILE}", file=sys.stderr)
 
 
 async def cmd_history(cli, args) -> None:
     entity = await resolve(cli, args.chat)
-    print(f"# {label(entity)} ({kind(entity)}, id={entity.id})\n")
-
     me = await cli.get_me()
-    rows = []
-    async for msg in cli.iter_messages(entity, limit=args.limit):
-        rows.append(msg)
 
-    for msg in reversed(rows):  # oldest first, like reading a chat
+    since = parse_when(args.since, "--since")
+    until = parse_when(args.until, "--until")
+    from_user = await resolve(cli, args.from_user) if args.from_user else None
+
+    # iter_messages walks backwards, so --until is where it starts and --since
+    # is where it stops; the server has no "from this date" offset to give it.
+    rows = []
+    async for msg in cli.iter_messages(entity, limit=args.limit, offset_date=until, from_user=from_user):
+        if since and msg.date and msg.date.astimezone(UTC) < since:
+            break
+        rows.append(msg)
+    rows.reverse()  # oldest first, like reading a chat
+
+    if emit({**entity_row(entity), "messages": [msg_row(m, me.id) for m in rows]}, args):
+        return
+    print(f"# {label(entity)} ({kind(entity)}, id={entity.id})\n")
+    for msg in rows:
         sender = msg.sender
         who = "me" if msg.sender_id == me.id else (label(sender) if sender else str(msg.sender_id))
         arrow = "->" if msg.sender_id == me.id else "<-"
@@ -677,13 +698,22 @@ async def cmd_history(cli, args) -> None:
 
 async def cmd_search(cli, args) -> None:
     entity = await resolve(cli, args.chat) if args.chat else None
-    n = 0
-    async for msg in cli.iter_messages(entity, search=args.query, limit=args.limit):
+    since = parse_when(args.since, "--since")
+    until = parse_when(args.until, "--until")
+
+    rows = []
+    async for msg in cli.iter_messages(entity, search=args.query, limit=args.limit, offset_date=until):
+        if since and msg.date and msg.date.astimezone(UTC) < since:
+            break
         chat = await msg.get_chat() if entity is None else entity
-        print(f"[{ts(msg.date)}] {label(chat)} (msg {msg.id})")
-        print(f"    {body(msg)}")
-        n += 1
-    print(f"\n-- {n} hit(s)", file=sys.stderr)
+        rows.append({**msg_row(msg), "chat": label(chat), "chat_id": getattr(chat, "id", None)})
+
+    if emit(rows, args):
+        return
+    for r in rows:
+        print(f"[{r['date']}] {r['chat']} (msg {r['id']})")
+        print(f"    {r['text']}")
+    print(f"\n-- {len(rows)} hit(s)", file=sys.stderr)
 
 
 async def cmd_send(cli, args) -> None:
@@ -1089,6 +1119,24 @@ async def cmd_folders(cli, args) -> None:
         print(f"\n-- in {len(holding)} folder(s)", file=sys.stderr)
         return
 
+    if emit(
+        [
+            {
+                "id": f.id,
+                "title": filter_title(f),
+                "color": f.color,
+                "chats": len(filter_peers(f)),
+                "pinned": len(getattr(f, "pinned_peers", []) or []),
+                "excluded": len(getattr(f, "exclude_peers", []) or []),
+                "shared": isinstance(f, DialogFilterChatlist),
+                "tags_enabled": tags_enabled,
+            }
+            for f in filters
+        ],
+        args,
+    ):
+        return
+
     for f in filters:
         pinned = len(getattr(f, "pinned_peers", []) or [])
         excluded = len(getattr(f, "exclude_peers", []) or [])
@@ -1224,16 +1272,10 @@ def build_parser() -> argparse.ArgumentParser:
     sp.set_defaults(fn=cmd_login)
     sub.add_parser("whoami", help="show the logged-in account").set_defaults(fn=cmd_whoami)
 
-    sp = sub.add_parser("chats", help="list conversations with their MTProto ids")
+    sp = add_json(sub.add_parser("chats", help="list conversations with their MTProto ids"))
     sp.add_argument("--limit", type=int, default=50)
     sp.add_argument("--unread", action="store_true", help="only chats with unread messages")
     sp.set_defaults(fn=cmd_chats)
-
-    sp = sub.add_parser("download", help="save the file behind a [document]/[photo] placeholder")
-    sp.add_argument("--chat", required=True)
-    sp.add_argument("--message", action="append", required=True, type=int, help="message id; repeat for several")
-    sp.add_argument("--out", help="target directory (default: the working directory)")
-    sp.set_defaults(fn=cmd_download)
 
     sp = add_json(sub.add_parser("contacts", help="the saved address book — far faster than scanning chats"))
     sp.add_argument("--query", help="filter by name or username")
@@ -1251,16 +1293,27 @@ def build_parser() -> argparse.ArgumentParser:
     sp.add_argument("--local", action="store_true", help="store in the state dir instead of beside the script")
     sp.set_defaults(fn=cmd_alias)
 
-    sp = sub.add_parser("history", help="read a chat backwards — the thing bots cannot do")
-    sp.add_argument("--chat", required=True, help="id, @username, or t.me link")
+    sp = add_json(sub.add_parser("history", help="read a chat backwards — the thing bots cannot do"))
+    sp.add_argument("--chat", required=True, help="id, @username, alias, title, or t.me link")
     sp.add_argument("--limit", type=int, default=50)
+    sp.add_argument("--since", help="stop at this ISO date, e.g. 2026-08-01")
+    sp.add_argument("--until", help="start from this ISO date, reading backwards")
+    sp.add_argument("--from-user", help="only messages from this person (useful in groups)")
     sp.set_defaults(fn=cmd_history)
 
-    sp = sub.add_parser("search", help="full-text search messages")
+    sp = add_json(sub.add_parser("search", help="full-text search messages"))
     sp.add_argument("--query", required=True)
     sp.add_argument("--chat", help="restrict to one chat (default: everywhere)")
     sp.add_argument("--limit", type=int, default=50)
+    sp.add_argument("--since", help="stop at this ISO date")
+    sp.add_argument("--until", help="start from this ISO date, reading backwards")
     sp.set_defaults(fn=cmd_search)
+
+    sp = sub.add_parser("download", help="save the file behind a [document]/[photo] placeholder")
+    sp.add_argument("--chat", required=True)
+    sp.add_argument("--message", action="append", required=True, type=int, help="message id; repeat for several")
+    sp.add_argument("--out", help="target directory (default: the working directory)")
+    sp.set_defaults(fn=cmd_download)
 
     sp = sub.add_parser("send", help="send a message as yourself")
     sp.add_argument("--chat", required=True, help="@username, t.me link, numeric id, or chat title")
@@ -1317,7 +1370,7 @@ def build_parser() -> argparse.ArgumentParser:
     sp.add_argument("--chat", action="append", required=True, help="repeat for several")
     sp.set_defaults(fn=cmd_read)
 
-    sp = sub.add_parser("folders", help="list chat folders — Telegram's per-chat tags")
+    sp = add_json(sub.add_parser("folders", help="list chat folders — Telegram's per-chat tags"))
     sp.add_argument("--chat", help="instead, show which folders this chat is in")
     sp.set_defaults(fn=cmd_folders)
 
