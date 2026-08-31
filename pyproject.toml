@@ -4,12 +4,16 @@ version = "0.2.0"
 description = "Parham's Telegram secretary — a user-mode MTProto client"
 readme = "README.md"
 requires-python = ">=3.14"
-license = { text = "MIT" }
+license = "MIT"
+license-files = ["LICENSE"]
 authors = [{ name = "Parham Alvani", email = "parham.alvani@gmail.com" }]
 dependencies = [
     "telethon>=1.41",
     "python-socks[asyncio]>=2.4",
 ]
+
+[project.urls]
+Repository = "https://github.com/1995parham/elbot"
 
 [dependency-groups]
 dev = [
