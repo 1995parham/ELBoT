@@ -689,20 +689,139 @@ async def cmd_search(cli, args) -> None:
 async def cmd_send(cli, args) -> None:
     entity = await resolve(cli, args.chat)
     text, entities = build_message(args.text, args.parse, args.quote, args.expandable)
+    when = parse_when(args.schedule, "--schedule")
 
     print("about to send")
     print("  as     : your own account — indistinguishable from you typing it")
     print(f"  chat   : {label(entity)} ({kind(entity)}, id={entity.id})")
     print(f"  parse  : {args.parse}{'  +quote' if args.quote else ''}{'  (expandable)' if args.expandable else ''}")
     print(f"  format : {format_summary(entities)}")
+    if when:
+        print(f"  when   : {ts(when)} (scheduled — Telegram delivers it, not this process)")
     print(f"  text   : {text}")
 
     if not args.yes:
         print("\nDRY RUN — nothing sent. Re-run with --yes to actually deliver.")
         return
 
-    msg = await cli.send_message(entity, text, formatting_entities=entities or None, reply_to=args.reply_to)
-    print(f"sent: message_id={msg.id} at {ts(msg.date)}")
+    msg = await cli.send_message(
+        entity, text, formatting_entities=entities or None, reply_to=args.reply_to, schedule=when
+    )
+    print(f"{'scheduled' if when else 'sent'}: message_id={msg.id} at {ts(msg.date)}")
+
+
+async def cmd_download(cli, args) -> None:
+    """Pull the file behind a `[document]` / `[photo]` placeholder onto disk."""
+    entity = await resolve(cli, args.chat)
+    msgs = await cli.get_messages(entity, ids=args.message)
+    out_dir = Path(args.out).expanduser() if args.out else Path.cwd()
+    out_dir.mkdir(parents=True, exist_ok=True)
+
+    saved = []
+    for mid, msg in zip(args.message, msgs, strict=True):
+        if msg is None:
+            print(f"message {mid}: not found in {label(entity)}", file=sys.stderr)
+            continue
+        if not msg.media:
+            print(f"message {mid}: no media to download", file=sys.stderr)
+            continue
+        path = await cli.download_media(msg, file=str(out_dir))
+        if path:
+            size = Path(path).stat().st_size / 1024 / 1024
+            saved.append({"message": mid, "path": str(path), "mb": round(size, 2)})
+            print(f"saved: {path}  ({size:.1f} MB)")
+
+    if not saved:
+        die("nothing downloaded")
+
+
+async def cmd_edit(cli, args) -> None:
+    """Rewrite one of your own messages in place.
+
+    Telegram keeps this open indefinitely for your own messages, and the chat
+    shows an "edited" marker rather than hiding the change.
+    """
+    entity = await resolve(cli, args.chat)
+    msgs = await cli.get_messages(entity, ids=[args.message])
+    target = msgs[0] if msgs else None
+    if target is None:
+        die(f"message {args.message} not found in {label(entity)}")
+
+    me = await cli.get_me()
+    if target.sender_id != me.id:
+        die(f"message {args.message} is not yours -- you can only edit your own messages")
+
+    text, entities = build_message(args.text, args.parse, args.quote, args.expandable)
+    print("about to edit")
+    print(f"  chat   : {label(entity)} ({kind(entity)}, id={entity.id})")
+    print(f"  message: {args.message} of {ts(target.date)}")
+    print(f"  before : {target.text or '[no text]'}")
+    print(f"  after  : {text}")
+    print(f"  format : {format_summary(entities)}")
+
+    if not args.yes:
+        print("\nDRY RUN -- nothing changed. Re-run with --yes to apply.")
+        return
+
+    await cli.edit_message(entity, args.message, text, formatting_entities=entities or None)
+    print(f"edited: message_id={args.message}")
+
+
+async def cmd_delete(cli, args) -> None:
+    """Delete messages, for everyone by default.
+
+    This is the undo that `send` deliberately does not have, so it prints every
+    message it is about to remove and needs --yes like any other write. --only-me
+    leaves the copy on the other side alone and just clears your own view.
+    """
+    entity = await resolve(cli, args.chat)
+    msgs = await cli.get_messages(entity, ids=args.message)
+    me = await cli.get_me()
+
+    found = [(mid, m) for mid, m in zip(args.message, msgs, strict=True) if m is not None]
+    if not found:
+        die(f"none of those messages exist in {label(entity)}")
+
+    print("about to delete")
+    print(f"  chat  : {label(entity)} ({kind(entity)}, id={entity.id})")
+    print(f"  scope : {'your own view only' if args.only_me else 'everyone in this chat'}")
+    for mid, msg in found:
+        who = "me" if msg.sender_id == me.id else (label(msg.sender) if msg.sender else str(msg.sender_id))
+        print(f"  - {mid} [{ts(msg.date)}] {who}: {body(msg)[:120]}")
+    missing = [mid for mid, m in zip(args.message, msgs, strict=True) if m is None]
+    if missing:
+        print(f"  (not found, skipped: {', '.join(str(m) for m in missing)})")
+
+    if not args.yes:
+        print("\nDRY RUN -- nothing deleted. Re-run with --yes to apply.")
+        return
+
+    await cli.delete_messages(entity, [mid for mid, _ in found], revoke=not args.only_me)
+    print(f"deleted: {len(found)} message(s)")
+
+
+async def cmd_forward(cli, args) -> None:
+    """Move messages between chats without retyping or losing attribution."""
+    src = await resolve(cli, args.chat)
+    dst = await resolve(cli, args.to)
+    msgs = await cli.get_messages(src, ids=args.message)
+    found = [(mid, m) for mid, m in zip(args.message, msgs, strict=True) if m is not None]
+    if not found:
+        die(f"none of those messages exist in {label(src)}")
+
+    print("about to forward")
+    print(f"  from  : {label(src)} ({kind(src)}, id={src.id})")
+    print(f"  to    : {label(dst)} ({kind(dst)}, id={dst.id})")
+    for mid, msg in found:
+        print(f"  - {mid} [{ts(msg.date)}]: {body(msg)[:120]}")
+
+    if not args.yes:
+        print("\nDRY RUN -- nothing forwarded. Re-run with --yes to deliver.")
+        return
+
+    sent = await cli.forward_messages(dst, [mid for mid, _ in found], src)
+    ids = [m.id for m in (sent if isinstance(sent, list) else [sent])]
+    print(f"forwarded: message_id(s)={ids}")
 
 
 async def cmd_contacts(cli, args) -> None:
@@ -900,6 +1019,7 @@ async def cmd_send_file(cli, args) -> None:
         caption=cap_text or None,
         formatting_entities=cap_entities or None,
         force_document=not args.photo,
+        reply_to=args.reply_to,
     )
     ids = [m.id for m in (sent if isinstance(sent, list) else [sent])]
     print(f"sent: message_id(s)={ids}")
@@ -1109,6 +1229,12 @@ def build_parser() -> argparse.ArgumentParser:
     sp.add_argument("--unread", action="store_true", help="only chats with unread messages")
     sp.set_defaults(fn=cmd_chats)
 
+    sp = sub.add_parser("download", help="save the file behind a [document]/[photo] placeholder")
+    sp.add_argument("--chat", required=True)
+    sp.add_argument("--message", action="append", required=True, type=int, help="message id; repeat for several")
+    sp.add_argument("--out", help="target directory (default: the working directory)")
+    sp.set_defaults(fn=cmd_download)
+
     sp = add_json(sub.add_parser("contacts", help="the saved address book — far faster than scanning chats"))
     sp.add_argument("--query", help="filter by name or username")
     sp.set_defaults(fn=cmd_contacts)
@@ -1145,8 +1271,33 @@ def build_parser() -> argparse.ArgumentParser:
     sp.add_argument("--quote", action="store_true", help="wrap the whole message in a blockquote")
     sp.add_argument("--expandable", action="store_true", help="collapsed tap-to-expand blockquote (implies --quote)")
     sp.add_argument("--reply-to", type=int)
+    sp.add_argument("--schedule", help="deliver later; ISO time like 2026-09-01T09:00")
     sp.add_argument("--yes", action="store_true", help="actually send (otherwise dry run)")
     sp.set_defaults(fn=cmd_send)
+
+    sp = sub.add_parser("edit", help="rewrite one of your own messages in place")
+    sp.add_argument("--chat", required=True)
+    sp.add_argument("--message", required=True, type=int, help="message id, from `history`")
+    sp.add_argument("--text", required=True)
+    sp.add_argument("--parse", default="markdown", choices=PARSE_CHOICES)
+    sp.add_argument("--quote", action="store_true")
+    sp.add_argument("--expandable", action="store_true")
+    sp.add_argument("--yes", action="store_true", help="actually edit (otherwise dry run)")
+    sp.set_defaults(fn=cmd_edit)
+
+    sp = sub.add_parser("delete", help="delete messages — the undo `send` does not have")
+    sp.add_argument("--chat", required=True)
+    sp.add_argument("--message", action="append", required=True, type=int, help="message id; repeat for several")
+    sp.add_argument("--only-me", action="store_true", help="clear your own view only, leaving their copy")
+    sp.add_argument("--yes", action="store_true", help="actually delete (otherwise dry run)")
+    sp.set_defaults(fn=cmd_delete)
+
+    sp = sub.add_parser("forward", help="forward messages from one chat to another")
+    sp.add_argument("--chat", required=True, help="the source chat")
+    sp.add_argument("--to", required=True, help="the destination chat")
+    sp.add_argument("--message", action="append", required=True, type=int, help="message id; repeat for several")
+    sp.add_argument("--yes", action="store_true", help="actually forward (otherwise dry run)")
+    sp.set_defaults(fn=cmd_forward)
 
     sp = sub.add_parser("create-group", help="create a supergroup containing only you")
     sp.add_argument("--title", required=True)
@@ -1196,6 +1347,7 @@ def build_parser() -> argparse.ArgumentParser:
     sp.add_argument("--quote", action="store_true", help="wrap the caption in a blockquote")
     sp.add_argument("--expandable", action="store_true", help="collapsed blockquote (implies --quote)")
     sp.add_argument("--photo", action="store_true", help="send as photo (recompressed) not document")
+    sp.add_argument("--reply-to", type=int)
     sp.add_argument("--yes", action="store_true")
     sp.set_defaults(fn=cmd_send_file)
 
