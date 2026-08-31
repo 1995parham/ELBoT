@@ -34,3 +34,6 @@ jobs:
 
             - name: Run ty (types)
               run: uv run ty check .
+
+            - name: Run pytest
+              run: uv run pytest

@@ -17,9 +17,14 @@ Repository = "https://github.com/1995parham/elbot"
 
 [dependency-groups]
 dev = [
+    "pytest>=9.1.1",
     "ruff>=0.16",
     "ty>=0.0.75",
 ]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+addopts = "-q"
 
 [tool.ruff]
 target-version = "py314"
