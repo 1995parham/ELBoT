@@ -1,29 +1,36 @@
-name: CI
-
+---
+name: ci
 on:
-  push:
-    branches: [main]
-  pull_request:
+    push:
+        branches: [main]
+    pull_request:
+
+permissions:
+    contents: read
 
 jobs:
-  lint:
-    runs-on: ubuntu-latest
-    steps:
-      - uses: actions/checkout@v4
+    lint:
+        runs-on: ubuntu-latest
+        steps:
+            - name: Checkout code
+              uses: actions/checkout@v7
 
-      - name: Install uv
-        uses: astral-sh/setup-uv@v6
-        with:
-          python-version: "3.14"
+            - name: Install uv
+              uses: astral-sh/setup-uv@v10
+              with:
+                  # No lock committed (see .gitignore) -- uv resolves telethon
+                  # to latest on each run, so a cache keyed on it buys nothing.
+                  enable-cache: false
+                  python-version: "3.14"
 
-      - name: Sync environment
-        run: uv sync
+            - name: Install dependencies
+              run: uv sync
 
-      - name: ruff (lint)
-        run: uv run ruff check .
+            - name: Run ruff (lint)
+              run: uv run ruff check .
 
-      - name: ruff (format)
-        run: uv run ruff format --check .
+            - name: Run ruff (format)
+              run: uv run ruff format --check .
 
-      - name: ty (types)
-        run: uv run ty check .
+            - name: Run ty (types)
+              run: uv run ty check .
