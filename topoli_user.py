@@ -41,6 +41,7 @@ try:
     from telethon.extensions import markdown as _markdown
     from telethon.sessions import SQLiteSession, StringSession
     from telethon.tl.functions.channels import CreateChannelRequest
+    from telethon.tl.functions.contacts import GetContactsRequest
     from telethon.tl.functions.messages import (
         GetDialogFiltersRequest,
         SendReactionRequest,
@@ -704,6 +705,71 @@ async def cmd_send(cli, args) -> None:
     print(f"sent: message_id={msg.id} at {ts(msg.date)}")
 
 
+async def cmd_contacts(cli, args) -> None:
+    """The saved address book in one RPC.
+
+    Finding a person by walking `iter_dialogs` costs a full scan -- minutes
+    through the proxy -- because it pages every conversation the account has
+    ever had. contacts.GetContacts returns the whole address book in a single
+    round trip, so this is the right way to answer "who is X". It also seeds the
+    title->id cache, which makes the *next* `send --chat "<name>"` instant.
+    """
+    res = await cli(GetContactsRequest(hash=0))
+    users = getattr(res, "users", [])
+    if users:  # cache every contact, not just the ones this query showed
+        save_index({**load_index(), **{str(u.id): entity_row(u) for u in users}})
+
+    q = (args.query or "").lower().lstrip("@")
+    hits = [u for u in users if not q or q in label(u).lower() or q in (getattr(u, "username", None) or "").lower()]
+    hits.sort(key=lambda u: label(u).lower())
+
+    if emit([{**entity_row(u), "phone": getattr(u, "phone", None)} for u in hits], args):
+        return
+    for u in hits:
+        phone = f"  +{u.phone}" if getattr(u, "phone", None) else ""
+        print(f"{u.id:>16}  {label(u)}{phone}")
+    print(f"\n-- {len(hits)} contact(s) of {len(users)}; cache: {INDEX_FILE}", file=sys.stderr)
+
+
+async def cmd_catchup(cli, args) -> None:
+    """Everything unread, in one pass -- the "what did I miss" command.
+
+    `history --limit N` makes you guess N. Telegram already tracks exactly how
+    many messages are unread per chat, so read that many and no more. Nothing is
+    marked read unless --read is passed: seeing a message and acknowledging it
+    are different acts, and the second one is visible to the other side.
+    """
+    me = await cli.get_me()
+    found = []  # (entity, unread_count, [message, ...])
+    async for dialog in cli.iter_dialogs(limit=args.limit):
+        unread = dialog.unread_count
+        if not unread:
+            continue
+        entity = dialog.entity
+        msgs = []
+        async for msg in cli.iter_messages(entity, limit=min(unread, args.max_per_chat)):
+            msgs.append(msg)
+        msgs.reverse()  # oldest first, like reading a chat
+        found.append((entity, unread, msgs))
+
+    rows = [{**entity_row(e), "unread": n, "messages": [msg_row(m, me.id) for m in msgs]} for e, n, msgs in found]
+    if not emit(rows, args):
+        for entity, unread, msgs in found:
+            more = f" (showing the last {len(msgs)})" if unread > len(msgs) else ""
+            print(f"\n# {label(entity)} ({kind(entity)}, id={entity.id}) — {unread} unread{more}")
+            for msg in msgs:
+                arrow = "->" if msg.sender_id == me.id else "<-"
+                print(f"[{ts(msg.date)}] {arrow} (msg {msg.id})")
+                print(f"    {body(msg)}")
+        total = sum(n for _, n, _ in found)
+        print(f"\n-- {total} unread message(s) across {len(found)} chat(s)", file=sys.stderr)
+
+    if args.read and found:
+        for entity, _, _ in found:
+            await cli.send_read_acknowledge(entity, clear_mentions=True)
+        print(f"marked read: {len(found)} chat(s)", file=sys.stderr)
+
+
 async def cmd_alias(cli, args) -> None:
     """Name a chat once, address it by that name forever.
 
@@ -1042,6 +1108,16 @@ def build_parser() -> argparse.ArgumentParser:
     sp.add_argument("--limit", type=int, default=50)
     sp.add_argument("--unread", action="store_true", help="only chats with unread messages")
     sp.set_defaults(fn=cmd_chats)
+
+    sp = add_json(sub.add_parser("contacts", help="the saved address book — far faster than scanning chats"))
+    sp.add_argument("--query", help="filter by name or username")
+    sp.set_defaults(fn=cmd_contacts)
+
+    sp = add_json(sub.add_parser("catchup", help="everything unread, exactly as much as is unread"))
+    sp.add_argument("--limit", type=int, default=100, help="how many chats to scan")
+    sp.add_argument("--max-per-chat", type=int, default=20, help="cap the messages shown per chat")
+    sp.add_argument("--read", action="store_true", help="mark them read afterwards (the other side sees this)")
+    sp.set_defaults(fn=cmd_catchup)
 
     sp = add_json(sub.add_parser("alias", help="name a chat once, address it by that name forever"))
     sp.add_argument("--set", nargs=2, metavar=("NAME", "CHAT"), help="e.g. --set wife @someone")
