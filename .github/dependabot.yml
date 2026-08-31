@@ -1,0 +1,16 @@
+---
+# REF: https://docs.github.com/en/code-security/supply-chain-security/keeping-your-actions-up-to-date-with-dependabot
+#
+# Only the actions are watched. The python dependencies are floors (`>=`) with
+# no lock committed, so uv already resolves them to latest on every run and
+# there is nothing for dependabot to bump.
+
+version: 2
+updates:
+    # Enable version updates for GitHub Actions
+    - package-ecosystem: "github-actions"
+      # Look for `.github/workflows` in the `root` directory
+      directory: "/"
+      # Check for updates once a week
+      schedule:
+          interval: "weekly"
