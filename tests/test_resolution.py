@@ -4,11 +4,19 @@ Everything here is the code that decides *who* a message goes to, which is the
 one class of bug in this tool that cannot be taken back after the fact.
 """
 
+import asyncio
 import json
+from types import SimpleNamespace
 
 import pytest
+from telethon.tl.types import Chat, ChatPhotoEmpty
 
 import topoli_user as t
+
+
+def chat(id_: int, title: str) -> Chat:
+    """A minimal basic group, which is what `label`/`kind` read."""
+    return Chat(id=id_, title=title, photo=ChatPhotoEmpty(), participants_count=0, date=None, version=0)
 
 
 class TestBotApiVariants:
@@ -86,6 +94,14 @@ class TestAliases:
         t.save_aliases({"wife": {"id": 2}}, local=True)
         assert t.load_aliases()["wife"]["id"] == 2
 
+    def test_removing_clears_both_books_not_just_the_first(self):
+        # The local book shadows the shared one, so stopping at the first hit
+        # left the alias apparently still set.
+        t.save_aliases({"wife": {"id": 1}}, local=False)
+        t.save_aliases({"wife": {"id": 2}}, local=True)
+        asyncio.run(t.cmd_alias(None, SimpleNamespace(remove="wife", set=None, local=False, json=False)))
+        assert t.load_aliases() == {}
+
     def test_saving_local_creates_the_state_directory(self):
         t.save_aliases({"mom": {"id": 7}}, local=True)
         assert json.loads(t.ALIAS_LOCAL.read_text())["mom"]["id"] == 7
@@ -138,3 +154,76 @@ class TestProxy:
         monkeypatch.setenv("TOPOLI_PROXY", "http://host")
         with pytest.raises(SystemExit):
             t.proxy()
+
+
+class TestIndexLookupWithUsernames:
+    """`label` appends " (@username)", so the stored title is never what you type."""
+
+    @pytest.fixture(autouse=True)
+    def _cache(self, tmp_path, monkeypatch):
+        monkeypatch.setattr(t, "INDEX_FILE", tmp_path / "chat-index.json")
+        monkeypatch.setattr(t, "STATE_DIR", tmp_path)
+        t.save_index(
+            {
+                "1": {"id": 1, "title": "Ops Team (@ops_chat)", "username": "ops_chat", "kind": "supergroup"},
+                "2": {"id": 2, "title": "Ops Team Archive", "username": None, "kind": "group"},
+            }
+        )
+
+    def test_the_bare_title_still_counts_as_an_exact_match(self):
+        # The full title is what anyone types; the "(@ops_chat)" suffix is
+        # something `label` added. Without stripping it the exact pass finds
+        # nothing, the substring pass returns both chats, and an unambiguous
+        # name is refused as ambiguous.
+        assert t.index_lookup("Ops Team") == [1]
+
+    def test_the_username_is_still_an_exact_match_of_its_own(self):
+        assert t.index_lookup("@ops_chat") == [1]
+
+    def test_a_genuine_substring_still_returns_every_candidate(self):
+        assert sorted(t.index_lookup("ops")) == [1, 2]
+
+
+class TestResolveByTitle:
+    """The live-dialog fallback, which runs on a cache miss."""
+
+    @pytest.fixture(autouse=True)
+    def _empty_cache(self, tmp_path, monkeypatch):
+        monkeypatch.setattr(t, "INDEX_FILE", tmp_path / "chat-index.json")
+        monkeypatch.setattr(t, "STATE_DIR", tmp_path)
+        monkeypatch.setattr(t, "ALIAS_REPO", tmp_path / "aliases.json")
+        monkeypatch.setattr(t, "ALIAS_LOCAL", tmp_path / "state" / "aliases.json")
+
+    @staticmethod
+    def _client(*chats):
+        class FakeClient:
+            async def get_entity(self, ref):
+                for c in chats:
+                    if c.id == ref:
+                        return c
+                raise ValueError(ref)
+
+            def iter_dialogs(self, limit=None):
+                async def gen():
+                    for c in chats:
+                        yield SimpleNamespace(entity=c)
+
+                return gen()
+
+        return FakeClient()
+
+    def test_a_single_match_resolves_after_one_scan(self):
+        cli = self._client(chat(1, "Ops Team"), chat(2, "Life Planning"))
+        assert asyncio.run(t.resolve(cli, "Life")).id == 2
+
+    def test_an_ambiguous_title_asks_instead_of_taking_the_first(self):
+        # This is the one that cannot be taken back: the old fallback broke on
+        # the first dialog whose name merely contained the text.
+        cli = self._client(chat(1, "Ops Team"), chat(2, "Ops Team Archive"))
+        with pytest.raises(SystemExit):
+            asyncio.run(t.resolve(cli, "Ops"))
+
+    def test_no_match_at_all_exits(self):
+        cli = self._client(chat(1, "Ops Team"))
+        with pytest.raises(SystemExit):
+            asyncio.run(t.resolve(cli, "nobody here"))

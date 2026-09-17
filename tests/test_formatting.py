@@ -5,6 +5,8 @@ the wrong unit still sends, it just underlines the wrong half of a sentence --
 so they are worth pinning down even though the tool as a whole is I/O.
 """
 
+from types import SimpleNamespace
+
 import pytest
 from telethon.tl.types import MessageEntityBlockquote, MessageEntityBold
 
@@ -73,3 +75,37 @@ class TestFormatSummary:
         summary = t.format_summary(entities)
         assert "Boldx2" in summary
         assert "Blockquote" in summary
+
+
+class TestQuoteOnAnEmptyMessage:
+    def test_an_empty_body_gets_no_blockquote(self):
+        # A 0-length entity is rejected by Telegram, so a --quote with nothing
+        # to quote must drop the entity rather than build an invalid one.
+        text, entities = t.build_message("", parse="none", quote=True)
+        assert (text, entities) == ("", [])
+
+
+class TestMsgRow:
+    def _msg(self, **kw):
+        return SimpleNamespace(
+            id=kw.get("id", 1),
+            date=None,
+            sender_id=kw.get("sender_id", 5),
+            sender=kw.get("sender"),
+            text=kw.get("text", "hi"),
+            media=None,
+            action=None,
+        )
+
+    def test_outgoing_needs_a_known_account(self):
+        # Without me_id nothing can be called outgoing; the old default
+        # compared sender_id against None and called channel posts "mine".
+        assert t.msg_row(self._msg(sender_id=None))["outgoing"] is False
+
+    def test_my_own_message_is_outgoing_and_reads_as_me(self):
+        row = t.msg_row(self._msg(sender_id=7), me_id=7)
+        assert row["outgoing"] is True
+        assert row["sender"] == "me"
+
+    def test_an_unknown_sender_falls_back_to_the_id(self):
+        assert t.msg_row(self._msg(sender_id=9), me_id=7)["sender"] == "9"

@@ -356,7 +356,7 @@ def build_message(raw: str, parse: str = "markdown", quote: bool = False, expand
     else:
         die(f"unknown parse mode {parse!r}; pick one of {', '.join(PARSE_CHOICES)}")
     entities = list(entities)
-    if quote or expandable:
+    if (quote or expandable) and text:
         entities.append(MessageEntityBlockquote(0, _utf16_len(text), collapsed=bool(expandable)))
     return text, entities
 
@@ -392,12 +392,29 @@ def index_put(entity) -> None:
     save_index(rows)
 
 
+def row_names(row) -> list[str]:
+    """The names a cached row answers to, lowercased.
+
+    `label` appends " (@username)" to the title, so the stored title of a chat
+    that has a username never equals the name anyone would type. Offer the bare
+    title alongside it, or exact matching silently degrades to substring
+    matching for every chat with a username.
+    """
+    title = (row.get("title") or "").lower()
+    uname = (row.get("username") or "").lower()
+    names = [title]
+    suffix = f" (@{uname})"
+    if uname and title.endswith(suffix):
+        names.append(title[: -len(suffix)])
+    return names
+
+
 def index_lookup(name: str):
     """Return [id,...] whose cached title/username matches name (exact ci, then
     substring). Empty list if the cache has no hit."""
     name = name.lower().lstrip("@")
     rows = load_index().values()
-    exact = [r["id"] for r in rows if r.get("title", "").lower() == name or (r.get("username") or "").lower() == name]
+    exact = [r["id"] for r in rows if name in row_names(r) or (r.get("username") or "").lower() == name]
     if exact:
         return exact
     return [r["id"] for r in rows if name in r.get("title", "").lower()]
@@ -414,7 +431,10 @@ async def refresh_index(cli):
         e = dialog.entity
         ents.append(e)
         rows[str(e.id)] = entity_row(e)
-    save_index(rows)
+    # Merge rather than replace: `contacts` seeds this same cache with people
+    # who have no dialog yet, and replacing it here would throw them away on
+    # the next scan.
+    save_index({**load_index(), **rows})
     return ents
 
 
@@ -443,27 +463,34 @@ async def resolve(cli, ref: str):
                 return ent
             except (ValueError, errors.RPCError) as exc:
                 die(f"cannot resolve {ref!r}: {exc}")
-        # A plain title: hit the cache first so repeat sends are instant.
-        ids = index_lookup(ref)
-        if len(ids) == 1:
+
+        async def by_title(ids):
+            """One candidate -> the entity; several -> stop and ask for the id."""
+            if len(ids) > 1:
+                rows = load_index()
+                opts = "; ".join(f"{i} {rows[str(i)]['title']}" for i in ids)
+                die(f"{ref!r} matches several chats: {opts}. Pass the numeric id.")
+            if not ids:
+                return None
             try:
                 ent = await cli.get_entity(ids[0])
-                index_put(ent)
-                return ent
             except ValueError, errors.RPCError:
-                pass
-        elif len(ids) > 1:
-            rows = load_index()
-            opts = "; ".join(f"{i} {rows[str(i)]['title']}" for i in ids)
-            die(f"{ref!r} matches several chats: {opts}. Pass the numeric id.")
-        # Cache miss (or first run): one live scan, refreshing the cache.
-        best = None
-        for e in await refresh_index(cli):
-            if ref.lower() in label(e).lower():
-                best = e
-                break
-        if best is not None:
-            return best
+                return None
+            index_put(ent)
+            return ent
+
+        # A plain title: hit the cache first so repeat sends are instant.
+        ent = await by_title(index_lookup(ref))
+        if ent is not None:
+            return ent
+        # Cache miss (or first run): one live scan, which refreshes the cache —
+        # then the same lookup again, so an ambiguous title stops and asks here
+        # too. Taking the first dialog whose name merely *contains* the text is
+        # how a message reaches the wrong person, and that cannot be taken back.
+        await refresh_index(cli)
+        ent = await by_title(index_lookup(ref))
+        if ent is not None:
+            return ent
         die(f"no chat matching {ref!r}. Run `chats` to list them, or pass the id.")
 
     raw = int(ref)
@@ -485,13 +512,22 @@ async def resolve(cli, ref: str):
     die(f"no chat with id {ref}. Bot API ids differ from MTProto ids — run `chats` and use the id printed there.")
 
 
+def sender_name(msg, me_id=None) -> str:
+    """Who sent it, by name. iter_messages caches the sender, so this is free."""
+    if me_id is not None and msg.sender_id == me_id:
+        return "me"
+    sender = getattr(msg, "sender", None)
+    return label(sender) if sender else str(msg.sender_id)
+
+
 def msg_row(msg, me_id=None) -> dict:
     """One message flattened for --json, mirroring what the text format prints."""
     return {
         "id": msg.id,
         "date": ts(msg.date),
-        "outgoing": msg.sender_id == me_id,
+        "outgoing": me_id is not None and msg.sender_id == me_id,
         "sender_id": msg.sender_id,
+        "sender": sender_name(msg, me_id),
         "text": body(msg),
     }
 
@@ -688,16 +724,15 @@ async def cmd_history(cli, args) -> None:
         return
     print(f"# {label(entity)} ({kind(entity)}, id={entity.id})\n")
     for msg in rows:
-        sender = msg.sender
-        who = "me" if msg.sender_id == me.id else (label(sender) if sender else str(msg.sender_id))
         arrow = "->" if msg.sender_id == me.id else "<-"
-        print(f"[{ts(msg.date)}] {arrow} {who} (msg {msg.id})")
+        print(f"[{ts(msg.date)}] {arrow} {sender_name(msg, me.id)} (msg {msg.id})")
         print(f"    {body(msg)}")
     print(f"\n-- {len(rows)} message(s)", file=sys.stderr)
 
 
 async def cmd_search(cli, args) -> None:
     entity = await resolve(cli, args.chat) if args.chat else None
+    me = await cli.get_me()
     since = parse_when(args.since, "--since")
     until = parse_when(args.until, "--until")
 
@@ -706,12 +741,12 @@ async def cmd_search(cli, args) -> None:
         if since and msg.date and msg.date.astimezone(UTC) < since:
             break
         chat = await msg.get_chat() if entity is None else entity
-        rows.append({**msg_row(msg), "chat": label(chat), "chat_id": getattr(chat, "id", None)})
+        rows.append({**msg_row(msg, me.id), "chat": label(chat), "chat_id": getattr(chat, "id", None)})
 
     if emit(rows, args):
         return
     for r in rows:
-        print(f"[{r['date']}] {r['chat']} (msg {r['id']})")
+        print(f"[{r['date']}] {r['chat']} — {r['sender']} (msg {r['id']})")
         print(f"    {r['text']}")
     print(f"\n-- {len(rows)} hit(s)", file=sys.stderr)
 
@@ -734,8 +769,17 @@ async def cmd_send(cli, args) -> None:
         print("\nDRY RUN — nothing sent. Re-run with --yes to actually deliver.")
         return
 
+    # parse_mode=None matters: telethon re-parses the text with its own default
+    # markdown whenever formatting_entities is empty, which is exactly the
+    # `--parse none` case — the one where the backticks and underscores in a
+    # path or an env var have to survive.
     msg = await cli.send_message(
-        entity, text, formatting_entities=entities or None, reply_to=args.reply_to, schedule=when
+        entity,
+        text,
+        formatting_entities=entities or None,
+        parse_mode=None,
+        reply_to=args.reply_to,
+        schedule=when,
     )
     print(f"{'scheduled' if when else 'sent'}: message_id={msg.id} at {ts(msg.date)}")
 
@@ -793,7 +837,7 @@ async def cmd_edit(cli, args) -> None:
         print("\nDRY RUN -- nothing changed. Re-run with --yes to apply.")
         return
 
-    await cli.edit_message(entity, args.message, text, formatting_entities=entities or None)
+    await cli.edit_message(entity, args.message, text, formatting_entities=entities or None, parse_mode=None)
     print(f"edited: message_id={args.message}")
 
 
@@ -908,7 +952,7 @@ async def cmd_catchup(cli, args) -> None:
             print(f"\n# {label(entity)} ({kind(entity)}, id={entity.id}) — {unread} unread{more}")
             for msg in msgs:
                 arrow = "->" if msg.sender_id == me.id else "<-"
-                print(f"[{ts(msg.date)}] {arrow} (msg {msg.id})")
+                print(f"[{ts(msg.date)}] {arrow} {sender_name(msg, me.id)} (msg {msg.id})")
                 print(f"    {body(msg)}")
         total = sum(n for _, n, _ in found)
         print(f"\n-- {total} unread message(s) across {len(found)} chat(s)", file=sys.stderr)
@@ -927,13 +971,18 @@ async def cmd_alias(cli, args) -> None:
     and re-registered by somebody else, but the id is the account.
     """
     if args.remove:
+        # Both books, not the first hit: the local one shadows the shared one,
+        # so stopping early would leave the alias apparently still set.
+        gone = []
         for target in (ALIAS_REPO, ALIAS_LOCAL):
             rows = {k.lower(): v for k, v in read_json(target).items()}
             if rows.pop(args.remove.lower(), None) is not None:
                 save_aliases(rows, local=target is ALIAS_LOCAL)
-                print(f"removed alias {args.remove!r} from {target}")
-                return
-        die(f"no alias called {args.remove!r}")
+                gone.append(target)
+        if not gone:
+            die(f"no alias called {args.remove!r}")
+        for target in gone:
+            print(f"removed alias {args.remove!r} from {target}")
 
     if args.set:
         name, ref = args.set
@@ -1048,6 +1097,7 @@ async def cmd_send_file(cli, args) -> None:
         [str(p) for p in paths],
         caption=cap_text or None,
         formatting_entities=cap_entities or None,
+        parse_mode=None,  # the caption is already parsed; see cmd_send
         force_document=not args.photo,
         reply_to=args.reply_to,
     )
@@ -1113,6 +1163,9 @@ async def cmd_folders(cli, args) -> None:
         entity = await resolve(cli, args.chat)
         target = utils.get_peer_id(entity)
         holding = [f for f in filters if any(utils.get_peer_id(p) == target for p in filter_peers(f))]
+        rows = [{"id": f.id, "title": filter_title(f), "color": f.color} for f in holding]
+        if emit({**entity_row(entity), "folders": rows, "tags_enabled": tags_enabled}, args):
+            return
         print(f"{label(entity)} ({kind(entity)}, id={entity.id})")
         for f in holding:
             print(f"  {filter_title(f)}  (id={f.id}, colour {f.color})")
