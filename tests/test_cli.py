@@ -10,11 +10,12 @@ import pytest
 import topoli_user as t
 
 WRITES = ["send", "send-file", "edit", "delete", "forward", "react", "create-group", "folder"]
-READS = ["chats", "contacts", "catchup", "alias", "history", "search", "folders"]
+READS = ["chats", "contacts", "catchup", "alias", "history", "search", "folders", "topics"]
 
 MINIMAL = {
     "setup": ["--api-id", "1", "--api-hash", "0" * 32],
     "history": ["--chat", "me"],
+    "topics": ["--chat", "me"],
     "search": ["--query", "x"],
     "send": ["--chat", "me", "--text", "hi"],
     "send-file": ["--chat", "me", "--file", "a.txt"],

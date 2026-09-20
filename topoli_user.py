@@ -42,8 +42,14 @@ try:
     from telethon.sessions import SQLiteSession, StringSession
     from telethon.tl.functions.channels import CreateChannelRequest
     from telethon.tl.functions.contacts import GetContactsRequest
+
+    # Forum topics: the RPC and its parameter name both moved. It is
+    # `messages.GetForumTopicsRequest(peer=…)` in the layer this script pins;
+    # older telethon had `channels.GetForumTopicsRequest(channel=…)`, and the
+    # PEP 723 header requires a version new enough that only the first exists.
     from telethon.tl.functions.messages import (
         GetDialogFiltersRequest,
+        GetForumTopicsRequest,
         SendReactionRequest,
         ToggleDialogFilterTagsRequest,
         UpdateDialogFilterRequest,
@@ -298,6 +304,23 @@ def kind(entity) -> str:
     return "?"
 
 
+def is_forum(entity) -> bool:
+    """Whether this supergroup is split into topics.
+
+    A forum is still a supergroup — `kind` keeps saying so, because that is what
+    it is — but a message sent to one without naming a topic lands in **General**
+    and is invisible to anyone reading the topic the conversation is actually in.
+    Everything topic-aware hangs off this flag.
+    """
+    return bool(getattr(entity, "forum", False))
+
+
+#: The General topic. Telegram gives it id 1 in every forum and never names it
+#: in the topic list the way the others are named, so it is spelled out here
+#: rather than looked up.
+GENERAL_TOPIC_ID = 1
+
+
 def entity_row(entity) -> dict:
     """One chat flattened the same way everywhere: the index, `chats`, --json."""
     return {
@@ -305,7 +328,57 @@ def entity_row(entity) -> dict:
         "title": label(entity),
         "username": getattr(entity, "username", None),
         "kind": kind(entity),
+        "forum": is_forum(entity),
     }
+
+
+def topic_row(topic) -> dict:
+    """One forum topic flattened for `topics` and --json."""
+    return {
+        "id": topic.id,
+        "title": getattr(topic, "title", ""),
+        "unread": getattr(topic, "unread_count", 0),
+        "closed": bool(getattr(topic, "closed", False)),
+        "pinned": bool(getattr(topic, "pinned", False)),
+        "general": topic.id == GENERAL_TOPIC_ID,
+    }
+
+
+def message_topic_id(msg) -> int | None:
+    """Which forum topic a message sits in, or None if that cannot be told.
+
+    Telegram does not stamp the topic onto the message; it is carried by the
+    reply header, and reading it wrong is how a reply ends up in the wrong
+    thread. Three shapes, in the order they are checked:
+
+    - a reply *inside* a topic points at the topic root through
+      ``reply_to_top_id``;
+    - the first reply to the root has only ``reply_to_msg_id``, which *is* the
+      root;
+    - a message in **General**, or in a group with no topics at all, carries no
+      header — so None means "not in a named topic", never "unknown".
+    """
+    header = getattr(msg, "reply_to", None)
+    if header is None or not getattr(header, "forum_topic", False):
+        return None
+    return getattr(header, "reply_to_top_id", None) or getattr(header, "reply_to_msg_id", None)
+
+
+def send_reply_to(reply_to: int | None, topic_id: int | None) -> int | None:
+    """The single id `send_message` may be given, from a reply and/or a topic.
+
+    Telethon's ``reply_to`` takes one integer, not a reply *and* a topic — it
+    wraps whatever it is handed in ``InputReplyToMessage``, so passing a
+    prepared object double-wraps it and the send fails. That is fine, because
+    Telegram derives the topic from the message being replied to: a reply
+    always lands in its parent's topic, which makes ``--reply-to`` the stronger
+    of the two and ``--topic`` redundant beside it.
+
+    So a reply wins. Where the two disagree, the caller is expected to have
+    refused already (see ``check_topic_matches``) rather than silently
+    delivering to the other thread.
+    """
+    return reply_to if reply_to is not None else topic_id
 
 
 def bot_api_variants(raw: int) -> list[int]:
@@ -521,13 +594,22 @@ def sender_name(msg, me_id=None) -> str:
 
 
 def msg_row(msg, me_id=None) -> dict:
-    """One message flattened for --json, mirroring what the text format prints."""
+    """One message flattened for --json, mirroring what the text format prints.
+
+    ``reply_to`` and ``topic_id`` are here because without them a group reads as
+    one flat conversation: four messages answering someone look like four
+    unprompted remarks, and a thread nobody can see is a thread nobody can
+    follow. Both are None in an ordinary chat.
+    """
+    header = getattr(msg, "reply_to", None)
     return {
         "id": msg.id,
         "date": ts(msg.date),
         "outgoing": me_id is not None and msg.sender_id == me_id,
         "sender_id": msg.sender_id,
         "sender": sender_name(msg, me_id),
+        "reply_to": getattr(header, "reply_to_msg_id", None) if header else None,
+        "topic_id": message_topic_id(msg),
         "text": body(msg),
     }
 
@@ -751,14 +833,142 @@ async def cmd_search(cli, args) -> None:
     print(f"\n-- {len(rows)} hit(s)", file=sys.stderr)
 
 
+def match_topic(topics: list[dict], ref: str) -> dict:
+    """Pick one topic from a title, an id, or the word "general".
+
+    Exact title first, then a unique case-insensitive substring — the same
+    ladder `resolve` walks for chat titles, and for the same reason: two
+    threads called "deploy" and "deploy v2" must not silently resolve to
+    whichever came back first. An ambiguous reference raises with the matches
+    listed, so the caller can print them and ask for an id.
+    """
+    raw = ref.strip()
+    if raw.lstrip("-").isdigit():
+        wanted = int(raw)
+        for topic in topics:
+            if topic["id"] == wanted:
+                return topic
+        raise LookupError(f"no topic with id {wanted} in this group")
+
+    if raw.casefold() == "general":
+        for topic in topics:
+            if topic["general"]:
+                return topic
+        raise LookupError("this group has no General topic")
+
+    exact = [t for t in topics if t["title"].casefold() == raw.casefold()]
+    if len(exact) == 1:
+        return exact[0]
+    if len(exact) > 1:
+        named = ", ".join(f"{t['title']} (id={t['id']})" for t in exact)
+        raise LookupError(f"{len(exact)} topics are called {raw!r}: {named}")
+
+    partial = [t for t in topics if raw.casefold() in t["title"].casefold()]
+    if len(partial) == 1:
+        return partial[0]
+    if not partial:
+        raise LookupError(f"no topic matching {raw!r}. Run `topics --chat …` to see them")
+    named = ", ".join(f"{t['title']} (id={t['id']})" for t in partial)
+    raise LookupError(f"{raw!r} matches {len(partial)} topics: {named}")
+
+
+async def fetch_topics(cli, entity) -> list[dict]:
+    """Every topic in a forum, newest activity first."""
+    res = await cli(
+        GetForumTopicsRequest(peer=entity, offset_date=None, offset_id=0, offset_topic=0, limit=100, q=None)
+    )
+    # ForumTopicDeleted carries an id and nothing else; it is not a destination.
+    return [topic_row(t) for t in res.topics if getattr(t, "title", None) is not None]
+
+
+async def resolve_topic(cli, entity, ref: str) -> dict:
+    """A --topic reference to one topic, or a clean exit explaining why not."""
+    if not is_forum(entity):
+        die(f"{label(entity)} has no topics — it is a {kind(entity)}, not a forum. Drop --topic.")
+    try:
+        return match_topic(await fetch_topics(cli, entity), ref)
+    except LookupError as exc:
+        die(str(exc))
+
+
+async def check_topic_matches(cli, entity, reply_to: int, topic: dict) -> None:
+    """Refuse a --reply-to and a --topic that point at different threads.
+
+    A reply always lands in its parent's topic, so when the two disagree the
+    `--topic` is not merely ignored — the message goes somewhere the caller
+    explicitly said it should not. Better to stop than to deliver it there.
+    """
+    parent = await cli.get_messages(entity, ids=reply_to)
+    if parent is None:
+        die(f"no message {reply_to} in {label(entity)}")
+    where = message_topic_id(parent) or GENERAL_TOPIC_ID
+    if where != topic["id"]:
+        die(
+            f"message {reply_to} is in topic {where}, not {topic['title']!r} (id={topic['id']}). "
+            "A reply always lands in its parent's topic — drop one of --reply-to / --topic."
+        )
+
+
+async def cmd_topics(cli, args) -> None:
+    """List a forum's topics, so --topic has something to name."""
+    entity = await resolve(cli, args.chat)
+    if not is_forum(entity):
+        if args.json:
+            print(json.dumps({"forum": False, "topics": []}, ensure_ascii=False, indent=2))
+        else:
+            print(f"{label(entity)} is a {kind(entity)} with no topics.")
+        return
+
+    topics = await fetch_topics(cli, entity)
+    if args.json:
+        print(json.dumps({"forum": True, "chat": entity_row(entity), "topics": topics}, ensure_ascii=False, indent=2))
+        return
+
+    print(f"{label(entity)} — {len(topics)} topic(s)")
+    for topic in topics:
+        marks = "".join(
+            [
+                " [general]" if topic["general"] else "",
+                " [pinned]" if topic["pinned"] else "",
+                " [closed]" if topic["closed"] else "",
+            ]
+        )
+        unread = f"  {topic['unread']} unread" if topic["unread"] else ""
+        print(f"  {topic['id']:>8}  {topic['title']}{marks}{unread}")
+
+
+async def target_topic(cli, entity, args) -> dict | None:
+    """The topic this send is aimed at, after every consistency check.
+
+    Also warns when a forum is about to be posted to without naming a topic:
+    that message lands in General, which in a group that lives in its topics is
+    the one place nobody is reading. It is a warning rather than a refusal
+    because General is a legitimate destination — but a silent one is how four
+    review comments end up somewhere the person who asked for them never looks.
+    """
+    topic = await resolve_topic(cli, entity, args.topic) if getattr(args, "topic", None) else None
+    reply_to = getattr(args, "reply_to", None)
+    if topic and reply_to is not None:
+        await check_topic_matches(cli, entity, reply_to, topic)
+    if is_forum(entity) and topic is None and reply_to is None:
+        print(f"  note   : {label(entity)} has topics and none was named — this goes to General")
+    return topic
+
+
 async def cmd_send(cli, args) -> None:
     entity = await resolve(cli, args.chat)
     text, entities = build_message(args.text, args.parse, args.quote, args.expandable)
     when = parse_when(args.schedule, "--schedule")
 
+    topic = await target_topic(cli, entity, args)
+
     print("about to send")
     print("  as     : your own account — indistinguishable from you typing it")
     print(f"  chat   : {label(entity)} ({kind(entity)}, id={entity.id})")
+    if topic:
+        print(f"  topic  : {topic['title']} (id={topic['id']})")
+    if args.reply_to:
+        print(f"  reply  : to message {args.reply_to}")
     print(f"  parse  : {args.parse}{'  +quote' if args.quote else ''}{'  (expandable)' if args.expandable else ''}")
     print(f"  format : {format_summary(entities)}")
     if when:
@@ -778,7 +988,7 @@ async def cmd_send(cli, args) -> None:
         text,
         formatting_entities=entities or None,
         parse_mode=None,
-        reply_to=args.reply_to,
+        reply_to=send_reply_to(args.reply_to, topic["id"] if topic else None),
         schedule=when,
     )
     print(f"{'scheduled' if when else 'sent'}: message_id={msg.id} at {ts(msg.date)}")
@@ -1077,9 +1287,15 @@ async def cmd_send_file(cli, args) -> None:
         if not p.is_file():
             die(f"no such file: {p}")
 
+    topic = await target_topic(cli, entity, args)
+
     print("about to send")
     print("  as    : your own account")
     print(f"  chat  : {label(entity)} ({kind(entity)}, id={entity.id})")
+    if topic:
+        print(f"  topic : {topic['title']} (id={topic['id']})")
+    if args.reply_to:
+        print(f"  reply : to message {args.reply_to}")
     for p in paths:
         print(f"  file  : {p}  ({p.stat().st_size / 1024 / 1024:.1f} MB)")
     cap_text, cap_entities = (
@@ -1099,7 +1315,7 @@ async def cmd_send_file(cli, args) -> None:
         formatting_entities=cap_entities or None,
         parse_mode=None,  # the caption is already parsed; see cmd_send
         force_document=not args.photo,
-        reply_to=args.reply_to,
+        reply_to=send_reply_to(args.reply_to, topic["id"] if topic else None),
     )
     ids = [m.id for m in (sent if isinstance(sent, list) else [sent])]
     print(f"sent: message_id(s)={ids}")
@@ -1307,6 +1523,10 @@ def add_json(sp):
     return sp
 
 
+#: Shared so `send` and `send-file` cannot drift into describing it differently.
+TOPIC_HELP = 'forum topic to post into: its id, its title, or "general". Run `topics` to list them'
+
+
 def build_parser() -> argparse.ArgumentParser:
     p = argparse.ArgumentParser(prog="topoli_user.py", description=__doc__.splitlines()[0])
     sub = p.add_subparsers(dest="cmd", required=True)
@@ -1368,6 +1588,10 @@ def build_parser() -> argparse.ArgumentParser:
     sp.add_argument("--out", help="target directory (default: the working directory)")
     sp.set_defaults(fn=cmd_download)
 
+    sp = add_json(sub.add_parser("topics", help="list a forum group's topics"))
+    sp.add_argument("--chat", required=True, help="id, @username, alias, title, or t.me link")
+    sp.set_defaults(fn=cmd_topics)
+
     sp = sub.add_parser("send", help="send a message as yourself")
     sp.add_argument("--chat", required=True, help="@username, t.me link, numeric id, or chat title")
     sp.add_argument("--text", required=True)
@@ -1377,6 +1601,7 @@ def build_parser() -> argparse.ArgumentParser:
     sp.add_argument("--quote", action="store_true", help="wrap the whole message in a blockquote")
     sp.add_argument("--expandable", action="store_true", help="collapsed tap-to-expand blockquote (implies --quote)")
     sp.add_argument("--reply-to", type=int)
+    sp.add_argument("--topic", help=TOPIC_HELP)
     sp.add_argument("--schedule", help="deliver later; ISO time like 2026-09-01T09:00")
     sp.add_argument("--yes", action="store_true", help="actually send (otherwise dry run)")
     sp.set_defaults(fn=cmd_send)
@@ -1454,6 +1679,7 @@ def build_parser() -> argparse.ArgumentParser:
     sp.add_argument("--expandable", action="store_true", help="collapsed blockquote (implies --quote)")
     sp.add_argument("--photo", action="store_true", help="send as photo (recompressed) not document")
     sp.add_argument("--reply-to", type=int)
+    sp.add_argument("--topic", help=TOPIC_HELP)
     sp.add_argument("--yes", action="store_true")
     sp.set_defaults(fn=cmd_send_file)
 
