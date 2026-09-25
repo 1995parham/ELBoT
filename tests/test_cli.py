@@ -9,7 +9,7 @@ import pytest
 
 import topoli_user as t
 
-WRITES = ["send", "send-file", "edit", "delete", "forward", "react", "create-group", "folder"]
+WRITES = ["send", "send-file", "edit", "delete", "forward", "react", "create-group", "folder", "chat-photo"]
 READS = ["chats", "contacts", "catchup", "alias", "history", "search", "folders", "topics"]
 
 MINIMAL = {
@@ -27,6 +27,7 @@ MINIMAL = {
     "read": ["--chat", "me"],
     "folder": ["--name", "x"],
     "create-group": ["--title", "x"],
+    "chat-photo": ["--chat", "me"],
 }
 
 
@@ -90,3 +91,16 @@ def test_send_can_be_scheduled_and_can_reply():
 
 def test_send_file_can_reply_too():
     assert parse([*["send-file"], *MINIMAL["send-file"], "--reply-to", "9"]).reply_to == 9
+
+
+def test_chat_photo_reads_without_a_dry_run_and_writes_with_one():
+    """Reading a photo has no consequences; replacing one has no undo.
+
+    Both live on the same subcommand, so the flags are what separate them --
+    a bare --chat only reports, and only --set or --remove arms the write.
+    """
+    read = parse(["chat-photo", "--chat", "me", "--out", "/tmp"])
+    assert read.set is None and read.remove is False and read.yes is False
+
+    write = parse(["chat-photo", "--chat", "me", "--set", "logo.png", "--yes"])
+    assert write.set == "logo.png" and write.yes is True

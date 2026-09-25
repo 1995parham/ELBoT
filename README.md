@@ -30,6 +30,8 @@ An alias exists for the case the others cannot settle: "wife" is not a Telegram 
 
 `history` and `search` take a date window (`--since` / `--until`, any ISO date), and `history` additionally takes `--from-user` to follow one person through a group. `history` prints media as `[document]` / `[photo]` placeholders; `download --chat X --message N` pulls the real file onto disk.
 
+A group's own photo is not a message, so `download` cannot reach it — `chat-photo` does. With only `--chat` it reports whether there is one and `--out DIR` saves it; `--set FILE` replaces it and `--remove` clears it, both dry runs until `--yes`. Save the current one before replacing it: everyone in the chat sees the change and Telegram offers no undo. Note a basic group and a supergroup take different RPCs behind this (`messages.EditChatPhoto` against a `Chat`, `channels.EditPhoto` against a `Channel`), which the tool picks for you — sending the wrong one fails as a type error that reads like a broken tool rather than a wrong call.
+
 Every read command takes `--json` for machine-readable output.
 
 ### Writing

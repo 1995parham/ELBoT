@@ -40,7 +40,7 @@ try:
     from telethon.extensions import html as _html
     from telethon.extensions import markdown as _markdown
     from telethon.sessions import SQLiteSession, StringSession
-    from telethon.tl.functions.channels import CreateChannelRequest
+    from telethon.tl.functions.channels import CreateChannelRequest, EditPhotoRequest
     from telethon.tl.functions.contacts import GetContactsRequest
 
     # Forum topics: the RPC and its parameter name both moved. It is
@@ -48,6 +48,7 @@ try:
     # older telethon had `channels.GetForumTopicsRequest(channel=…)`, and the
     # PEP 723 header requires a version new enough that only the first exists.
     from telethon.tl.functions.messages import (
+        EditChatPhotoRequest,
         GetDialogFiltersRequest,
         GetForumTopicsRequest,
         SendReactionRequest,
@@ -58,6 +59,8 @@ try:
         Channel,
         Chat,
         DialogFilterChatlist,
+        InputChatPhotoEmpty,
+        InputChatUploadedPhoto,
         MessageEntityBlockquote,
         ReactionEmoji,
         User,
@@ -1019,6 +1022,90 @@ async def cmd_download(cli, args) -> None:
         die("nothing downloaded")
 
 
+def photo_request(entity, photo):
+    """The RPC that changes one chat's photo, which is not one RPC.
+
+    A basic group and a supergroup take different requests with different
+    parameter names — `messages.EditChatPhoto(chat_id=…)` against a `Chat`,
+    `channels.EditPhoto(channel=…)` against a `Channel`. Sending the wrong one
+    fails with a type error rather than a permission error, which reads as a
+    bug in the tool rather than the wrong call, so the choice is made here and
+    covered by a test.
+
+    A `User` has no chat photo to edit. Changing your *own* avatar is
+    `photos.UploadProfilePhoto`, a different thing with a much wider blast
+    radius, so this refuses rather than quietly doing it.
+    """
+    if isinstance(entity, Chat):
+        return EditChatPhotoRequest(chat_id=entity.id, photo=photo)
+    if isinstance(entity, Channel):
+        return EditPhotoRequest(channel=entity, photo=photo)
+    die("a chat photo belongs to a group or channel; this is a private chat")
+
+
+async def cmd_chat_photo(cli, args) -> None:
+    """Read, replace or clear a group's photo.
+
+    With neither --set nor --remove this only reports what is there, and
+    --out saves it. That asymmetry is deliberate: fetching a photo is how you
+    find out what you are about to overwrite, and it is the half that has no
+    consequences.
+
+    Replacing one is a write like any other here — everyone in the group sees
+    it, and Telegram keeps no undo — so it prints what it is about to do and
+    needs --yes. There is no way to restore the previous photo except by
+    setting it again, which is why --out exists and why this prints a reminder
+    to use it first.
+    """
+    entity = await resolve(cli, args.chat)
+
+    if args.set and args.remove:
+        die("--set replaces the photo and --remove clears it; pick one")
+
+    if not args.set and not args.remove:
+        out_dir = Path(args.out).expanduser() if args.out else None
+        if out_dir:
+            out_dir.mkdir(parents=True, exist_ok=True)
+        path = await cli.download_profile_photo(entity, file=str(out_dir) if out_dir else bytes, download_big=True)
+        if not path:
+            print(f"{label(entity)} ({kind(entity)}, id={entity.id}) has no photo")
+            return
+        if out_dir:
+            size = Path(path).stat().st_size / 1024
+            print(f"saved: {path}  ({size:.0f} KB)")
+        else:
+            print(f"{label(entity)} has a photo ({len(path)} bytes); pass --out DIR to save it")
+        return
+
+    print("about to change a chat photo")
+    print(f"  chat  : {label(entity)} ({kind(entity)}, id={entity.id})")
+    if args.set:
+        src = Path(args.set).expanduser()
+        if not src.is_file():
+            die(f"no such file: {src}")
+        print(f"  set   : {src}  ({src.stat().st_size / 1024:.0f} KB)")
+    else:
+        print("  remove: the group will have no photo")
+    print("  note  : everyone in the chat sees this, and there is no undo —")
+    print("          save the current one first with --out if it matters")
+
+    if not args.yes:
+        print("\nDRY RUN -- nothing changed. Re-run with --yes to apply.")
+        return
+
+    if args.set:
+        uploaded = await cli.upload_file(str(Path(args.set).expanduser()))
+        photo = InputChatUploadedPhoto(file=uploaded)
+    else:
+        photo = InputChatPhotoEmpty()
+
+    try:
+        await cli(photo_request(entity, photo))
+    except errors.ChatAdminRequiredError:
+        die(f"changing the photo of {label(entity)} needs admin rights in that chat")
+    print("chat photo updated" if args.set else "chat photo removed")
+
+
 async def cmd_edit(cli, args) -> None:
     """Rewrite one of your own messages in place.
 
@@ -1587,6 +1674,14 @@ def build_parser() -> argparse.ArgumentParser:
     sp.add_argument("--message", action="append", required=True, type=int, help="message id; repeat for several")
     sp.add_argument("--out", help="target directory (default: the working directory)")
     sp.set_defaults(fn=cmd_download)
+
+    sp = sub.add_parser("chat-photo", help="read, replace or clear a group's photo")
+    sp.add_argument("--chat", required=True)
+    sp.add_argument("--out", help="save the current photo into this directory")
+    sp.add_argument("--set", metavar="FILE", help="replace the photo with this image")
+    sp.add_argument("--remove", action="store_true", help="clear the photo entirely")
+    sp.add_argument("--yes", action="store_true", help="apply; without it this is a dry run")
+    sp.set_defaults(fn=cmd_chat_photo)
 
     sp = add_json(sub.add_parser("topics", help="list a forum group's topics"))
     sp.add_argument("--chat", required=True, help="id, @username, alias, title, or t.me link")
