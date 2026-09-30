@@ -8,7 +8,13 @@ so they are worth pinning down even though the tool as a whole is I/O.
 from types import SimpleNamespace
 
 import pytest
-from telethon.tl.types import MessageEntityBlockquote, MessageEntityBold
+from telethon.tl.types import (
+    MessageEntityBlockquote,
+    MessageEntityBold,
+    MessageEntityCode,
+    MessageEntityPre,
+    MessageEntitySpoiler,
+)
 
 import topoli_user as t
 
@@ -64,6 +70,76 @@ class TestBuildMessage:
     def test_unknown_parse_mode_exits(self):
         with pytest.raises(SystemExit):
             t.build_message("x", parse="rtf")
+
+
+def spans(text, entities, kind):
+    """The substrings an entity type covers, read back in UTF-16 units."""
+    s = text.encode("utf-16-le")
+    return [s[e.offset * 2 : (e.offset + e.length) * 2].decode("utf-16-le") for e in entities if isinstance(e, kind)]
+
+
+class TestMarkdownExtensions:
+    """What telethon's markdown drops silently, and the desktop client has."""
+
+    def test_spoiler(self):
+        text, entities = t.build_message("see ||the answer|| 👋")
+        assert text == "see the answer 👋"
+        assert spans(text, entities, MessageEntitySpoiler) == ["the answer"]
+
+    def test_fence_language_becomes_the_pre_language(self):
+        text, entities = t.build_message("run:\n```bash\nls -la\n```\n**done**")
+        # Without this the word "bash" is sent as the first line of code.
+        assert text == "run:\nls -la\ndone"
+        pre = next(e for e in entities if isinstance(e, MessageEntityPre))
+        assert pre.language == "bash"
+        assert spans(text, entities, MessageEntityPre) == ["ls -la"]
+        assert spans(text, entities, MessageEntityBold) == ["done"]
+
+    def test_a_bare_fence_keeps_its_first_line_as_code(self):
+        text, entities = t.build_message("```\nfoo\nbar\n```")
+        assert text == "foo\nbar"
+        assert next(e for e in entities if isinstance(e, MessageEntityPre)).language == ""
+
+    def test_code_on_the_fence_line_is_not_a_language(self):
+        text, entities = t.build_message("```x = 1\ny```")
+        assert text == "x = 1\ny"
+        assert next(e for e in entities if isinstance(e, MessageEntityPre)).language == ""
+
+    def test_quote_lines_group_into_one_blockquote_each_run(self):
+        text, entities = t.build_message("> سلام **👋**\n> دوم\nplain\n>third")
+        assert text == "سلام 👋\nدوم\nplain\nthird"
+        assert spans(text, entities, MessageEntityBlockquote) == ["سلام 👋\nدوم", "third"]
+        # The bold must move left with the stripped `> `, across the emoji.
+        assert spans(text, entities, MessageEntityBold) == ["👋"]
+
+    def test_quote_marker_inside_code_is_content(self):
+        text, entities = t.build_message("```\n> $ make\n```\n`> x`")
+        assert text == "> $ make\n> x"
+        assert not any(isinstance(e, MessageEntityBlockquote) for e in entities)
+        assert spans(text, entities, MessageEntityCode) == ["> x"]
+
+    def test_quote_flag_replaces_inner_quotes(self):
+        # Telegram rejects nested blockquotes.
+        text, entities = t.build_message("> a\nb", quote=True)
+        quotes = [e for e in entities if isinstance(e, MessageEntityBlockquote)]
+        assert len(quotes) == 1
+        assert (quotes[0].offset, quotes[0].length) == (0, t._utf16_len(text))
+
+
+class TestHtmlExtensions:
+    @pytest.mark.parametrize("markup", ["<tg-spoiler>x</tg-spoiler>", '<span class="tg-spoiler">x</span>'])
+    def test_spoiler_tags(self, markup):
+        text, entities = t.build_message(f"<b>a</b> {markup}", parse="html")
+        assert text == "a x"
+        assert spans(text, entities, MessageEntitySpoiler) == ["x"]
+
+    def test_other_spans_are_ignored(self):
+        text, entities = t.build_message('<span class="x">y</span>', parse="html")
+        assert (text, entities) == ("y", [])
+
+    def test_pre_language(self):
+        _, entities = t.build_message('<pre><code class="language-go">x</code></pre>', parse="html")
+        assert entities[0].language == "go"
 
 
 class TestFormatSummary:

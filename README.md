@@ -36,7 +36,7 @@ Every read command takes `--json` for machine-readable output.
 
 ### Writing
 
-`send` (and the `send-file` caption) honour `--parse {markdown,html,none}`, and `--quote` / `--expandable` wrap a message in a real Telegram blockquote — a leading `>` is chat-app shorthand, not Telegram markup, and would send literally. `--schedule 2026-09-01T09:00` hands delivery to Telegram rather than keeping a process alive.
+`send`, `edit` and the `send-file` caption honour `--parse {markdown,html,none}`. Markdown is Telegram Desktop's dialect: `**bold**`, `__italic__`, `~~strike~~`, `||spoiler||`, `` `code` ``, a ```` ```lang ```` fence for a highlighted block, `[label](url)`, and `>`-prefixed lines as a blockquote. HTML adds `<u>` underline, `<tg-spoiler>` and `<blockquote expandable>`. Single `*` and `_` are *not* markup, so `__init__` and `a || b` outside backticks are eaten — use `--parse none` for text full of them. `--quote` / `--expandable` wrap the whole message in a blockquote in any mode. `--schedule 2026-09-01T09:00` hands delivery to Telegram rather than keeping a process alive.
 
 Every write is a **dry run** until you add `--yes`; it prints the resolved recipient and the exact text first. `edit`, `delete` and `forward` follow the same rule — `delete` removes for everyone by default, and `--only-me` clears just your own view.
 

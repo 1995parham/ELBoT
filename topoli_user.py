@@ -27,6 +27,7 @@ import binascii
 import contextlib
 import json
 import os
+import re
 import struct
 import sys
 from collections import Counter
@@ -39,6 +40,7 @@ try:
     from telethon import TelegramClient, errors, utils
     from telethon.extensions import html as _html
     from telethon.extensions import markdown as _markdown
+    from telethon.helpers import add_surrogate, del_surrogate, strip_text
     from telethon.sessions import SQLiteSession, StringSession
     from telethon.tl.functions.channels import CreateChannelRequest, EditPhotoRequest
     from telethon.tl.functions.contacts import GetContactsRequest
@@ -62,6 +64,9 @@ try:
         InputChatPhotoEmpty,
         InputChatUploadedPhoto,
         MessageEntityBlockquote,
+        MessageEntityCode,
+        MessageEntityPre,
+        MessageEntitySpoiler,
         ReactionEmoji,
         User,
     )
@@ -413,26 +418,125 @@ def _utf16_len(text: str) -> int:
     return len(text.encode("utf-16-le")) // 2
 
 
+# Telethon's markdown is Telegram Desktop's dialect with three holes, all of
+# which fail quietly rather than with an error: `||spoiler||` goes out as
+# literal pipes, a `> ` line goes out as a literal `>`, and the info string of a
+# fenced block (```python) stays in the text as the first line of code with no
+# highlighting. The delimiter is a telethon extension point; the other two are
+# patched around its parser below.
+MARKDOWN_DELIMITERS = {**_markdown.DEFAULT_DELIMITERS, "||": MessageEntitySpoiler}
+
+# A fence whose opening line is only an info string. ```one-liner``` and code
+# written on the fence line itself (```x = 1) do not match and are left to
+# telethon, which renders both as a plain pre block.
+_FENCE = re.compile(r"```([\w+#.-]*)\n(.*?)\n?```", re.DOTALL)
+_CODE = (MessageEntityCode, MessageEntityPre)
+
+
+def _cut(text: str, entities, at: int, n: int) -> str:
+    """Delete n UTF-16 units at `at` from surrogate text, keeping entities aligned."""
+    for e in entities:
+        lost = max(0, min(e.offset + e.length, at + n) - max(e.offset, at))
+        if e.offset >= at + n:
+            e.offset -= n
+        elif e.offset > at:
+            e.offset = at
+        e.length -= lost
+    return text[:at] + text[at + n :]
+
+
+def _quote_lines(text: str, entities) -> tuple[str, list]:
+    """Turn runs of `>`-prefixed lines into blockquote entities, as the desktop does.
+
+    Lines inside code keep their `>` — a shell prompt or a diff in a code
+    block is content, not markup.
+    """
+    s = add_surrogate(text)
+    quotes: list[list[int]] = []
+    pos = 0
+    while pos < len(s):
+        eol = s.find("\n", pos)
+        eol = len(s) if eol == -1 else eol
+        in_code = any(e.offset <= pos < e.offset + e.length for e in entities if isinstance(e, _CODE))
+        if s.startswith(">", pos) and not in_code:
+            n = 2 if s.startswith("> ", pos) else 1
+            s = _cut(s, entities, pos, n)
+            eol -= n
+            if quotes and quotes[-1][1] == pos - 1:
+                quotes[-1][1] = eol
+            else:
+                quotes.append([pos, eol])
+        pos = eol + 1
+    entities.extend(MessageEntityBlockquote(a, b - a) for a, b in quotes if b > a)
+    return del_surrogate(s), entities
+
+
+def parse_markdown(raw: str) -> tuple[str, list]:
+    languages: list[str] = []
+
+    def fence(m: re.Match) -> str:
+        languages.append(m.group(1))
+        return f"```{m.group(2)}```"
+
+    text, entities = _markdown.parse(_FENCE.sub(fence, raw), delimiters=MARKDOWN_DELIMITERS)
+    entities = list(entities)
+    pres = sorted((e for e in entities if isinstance(e, MessageEntityPre)), key=lambda e: e.offset)
+    # A fence inside inline code would throw the pairing off; better no
+    # highlighting than the wrong language on every block after it.
+    if len(pres) == len(languages):
+        for e, lang in zip(pres, languages, strict=True):
+            e.language = lang
+    return _quote_lines(text, entities)
+
+
+class _HTMLParser(_html.HTMLToTelegramParser):
+    """Telethon's HTML parser plus the spoiler, in both of Telegram's spellings."""
+
+    def handle_starttag(self, tag, attrs):
+        classes = (dict(attrs).get("class") or "").split()
+        if tag == "tg-spoiler" or (tag == "span" and "tg-spoiler" in classes):
+            self._open_tags.appendleft(tag)
+            self._open_tags_meta.appendleft(None)
+            self._building_entities.setdefault(tag, MessageEntitySpoiler(offset=len(self.text), length=0))
+            return
+        super().handle_starttag(tag, attrs)
+
+
+def parse_html(raw: str) -> tuple[str, list]:
+    """telethon.extensions.html.parse, on the parser above."""
+    if not raw:
+        return raw, []
+    parser = _HTMLParser()
+    parser.feed(add_surrogate(raw))
+    text = strip_text(parser.text, parser.entities)
+    parser.entities.reverse()
+    parser.entities.sort(key=lambda e: e.offset)
+    return del_surrogate(text), parser.entities
+
+
 def build_message(raw: str, parse: str = "markdown", quote: bool = False, expandable: bool = False):
     """Turn raw text into (text, entities) for send_message.
 
-    parse: 'markdown' (default; bold ** italic __ strike ~~ code ` pre ``` link
-    [t](url)), 'html' (adds <u> and <blockquote>), or 'none'. Markdown has no
-    blockquote/underline/spoiler in Telethon, so use --quote / html for those.
+    parse: 'markdown' (default; bold ** italic __ strike ~~ spoiler || code `
+    pre ```lang, link [t](url), and `>` lines as a blockquote), 'html' (adds
+    <u> underline and <tg-spoiler>), or 'none'.
     quote wraps the whole message in a blockquote; expandable makes it the
     collapsed (tap-to-expand) kind and implies quote.
     """
     mode = (parse or "markdown").lower()
     if mode in ("markdown", "md"):
-        text, entities = _markdown.parse(raw)
+        text, entities = parse_markdown(raw)
     elif mode == "html":
-        text, entities = _html.parse(raw)
+        text, entities = parse_html(raw)
     elif mode in ("none", "plain"):
         text, entities = raw, []
     else:
         die(f"unknown parse mode {parse!r}; pick one of {', '.join(PARSE_CHOICES)}")
     entities = list(entities)
     if (quote or expandable) and text:
+        # Telegram rejects a blockquote inside a blockquote, so the whole-message
+        # one replaces any the markup made.
+        entities = [e for e in entities if not isinstance(e, MessageEntityBlockquote)]
         entities.append(MessageEntityBlockquote(0, _utf16_len(text), collapsed=bool(expandable)))
     return text, entities
 
@@ -1691,7 +1795,10 @@ def build_parser() -> argparse.ArgumentParser:
     sp.add_argument("--chat", required=True, help="@username, t.me link, numeric id, or chat title")
     sp.add_argument("--text", required=True)
     sp.add_argument(
-        "--parse", default="markdown", choices=PARSE_CHOICES, help="text markup: markdown (default), html, or none"
+        "--parse",
+        default="markdown",
+        choices=PARSE_CHOICES,
+        help="text markup: markdown (default; ** __ ~~ || ` ```lang [t](url) and > lines), html, or none",
     )
     sp.add_argument("--quote", action="store_true", help="wrap the whole message in a blockquote")
     sp.add_argument("--expandable", action="store_true", help="collapsed tap-to-expand blockquote (implies --quote)")
