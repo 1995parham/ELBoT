@@ -94,7 +94,7 @@ class TestToolArgv:
                 args[key] = {"integer": 1, "string": "x", "array": ["a", "b"]}[prop["type"]]
                 if prop["type"] == "array" and prop["items"]["type"] == "integer":
                     args[key] = [1]
-            if name in ("send", "edit"):
+            if name in ("send", "edit", "remind"):
                 args["text"] = "x"
             parser.parse_args(t.tool_argv(parser, name, args))
 

@@ -28,6 +28,7 @@ WRITES = [
     "profile",
     "poll",
     "sessions",
+    "scheduled",
 ]
 READS = [
     "chats",
@@ -47,6 +48,8 @@ READS = [
     "listen",
     "export",
     "device",
+    "receipts",
+    "tag",
 ]
 
 MINIMAL = {
@@ -76,6 +79,9 @@ MINIMAL = {
     "join": ["--link", "@x"],
     "leave": ["--chat", "me"],
     "poll": ["--chat", "me", "--question", "q", "--option", "a", "--option", "b"],
+    "receipts": ["--chat", "me", "--message", "1"],
+    "remind": ["--text", "x", "--in", "1h"],
+    "typing": ["--chat", "me"],
 }
 
 

@@ -36,10 +36,11 @@ import re
 import struct
 import sys
 from collections import Counter
+from collections.abc import Callable
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from typing import NoReturn
-from urllib.parse import urlparse
+from urllib.parse import unquote, urlparse
 
 try:
     from telethon import TelegramClient, errors, events, utils
@@ -67,15 +68,21 @@ try:
     # older telethon had `channels.GetForumTopicsRequest(channel=…)`, and the
     # PEP 723 header requires a version new enough that only the first exists.
     from telethon.tl.functions.messages import (
+        DeleteScheduledMessagesRequest,
         EditChatPhotoRequest,
         GetDialogFiltersRequest,
         GetForumTopicsRequest,
         GetFullChatRequest,
+        GetMessageReadParticipantsRequest,
+        GetOutboxReadDateRequest,
+        GetPeerDialogsRequest,
+        GetScheduledHistoryRequest,
         GetUnreadMentionsRequest,
         ImportChatInviteRequest,
         MarkDialogUnreadRequest,
         SaveDraftRequest,
         SendReactionRequest,
+        SendScheduledMessagesRequest,
         ToggleDialogFilterTagsRequest,
         TranscribeAudioRequest,
         UpdateDialogFilterRequest,
@@ -189,7 +196,7 @@ def invocation() -> str:
     return base if ACCOUNT == DEFAULT_ACCOUNT else f"{base} --account {ACCOUNT}"
 
 
-VERSION = "0.3.0"
+VERSION = "0.4.0"
 
 #: Set while a command runs with --json, so `die` can answer in the same
 #: format: a caller parsing stdout must get an object, not an empty string.
@@ -1127,14 +1134,18 @@ async def cmd_whoami(cli, args) -> None:
 
 async def cmd_chats(cli, args) -> None:
     rows, shown = {}, []
+    only = tagged_ids(args.tag)
     async for dialog in cli.iter_dialogs(limit=args.limit):
         ent = dialog.entity
         rows[str(ent.id)] = entity_row(ent)
         if args.unread and not dialog.unread_count:
             continue
+        if only is not None and ent.id not in only:
+            continue
         shown.append(
             {
                 **entity_row(ent),
+                "tags": tags_of(ent.id),
                 "unread": dialog.unread_count,
                 "last_date": ts(dialog.message.date) if dialog.message else None,
                 "last_text": body(dialog.message) if dialog.message else None,
@@ -1360,6 +1371,7 @@ async def cmd_send(cli, args) -> None:
         dry_run(args, plan, "DRY RUN — nothing sent. Re-run with --yes to actually deliver.")
         return
 
+    stop_typing(entity.id)
     # parse_mode=None matters: telethon re-parses the text with its own default
     # markdown whenever formatting_entities is empty, which is exactly the
     # `--parse none` case — the one where the backticks and underscores in a
@@ -1634,19 +1646,25 @@ async def cmd_catchup(cli, args) -> None:
     are different acts, and the second one is visible to the other side.
     """
     me = await cli.get_me()
+    only = tagged_ids(args.tag)
     found = []  # (entity, unread_count, [message, ...])
     async for dialog in cli.iter_dialogs(limit=args.limit):
         unread = dialog.unread_count
         if not unread:
             continue
         entity = dialog.entity
+        if only is not None and entity.id not in only:
+            continue
         msgs = []
         async for msg in cli.iter_messages(entity, limit=min(unread, args.max_per_chat)):
             msgs.append(msg)
         msgs.reverse()  # oldest first, like reading a chat
         found.append((entity, unread, msgs))
 
-    rows = [{**entity_row(e), "unread": n, "messages": [msg_row(m, me.id) for m in msgs]} for e, n, msgs in found]
+    rows = [
+        {**entity_row(e), "tags": tags_of(e.id), "unread": n, "messages": [msg_row(m, me.id) for m in msgs]}
+        for e, n, msgs in found
+    ]
     if not emit(rows, args):
         for entity, unread, msgs in found:
             more = f" (showing the last {len(msgs)})" if unread > len(msgs) else ""
@@ -1815,6 +1833,7 @@ async def cmd_send_file(cli, args) -> None:
         dry_run(args, plan, "DRY RUN — nothing sent. Re-run with --yes to actually deliver.")
         return
 
+    stop_typing(entity.id)
     sent = await cli.send_file(
         entity,
         [str(p) for p in paths],
@@ -2205,10 +2224,13 @@ async def cmd_mentions(cli, args) -> None:
     me = await cli.get_me()
     out: list[dict] = []
     total = 0
+    only = tagged_ids(args.tag)
     async for dialog in cli.iter_dialogs(limit=args.limit):
         if not getattr(dialog, "unread_mentions_count", 0):
             continue
         entity = dialog.entity
+        if only is not None and entity.id not in only:
+            continue
         res = await cli(
             GetUnreadMentionsRequest(
                 peer=entity, offset_id=0, add_offset=0, limit=args.max_per_chat, max_id=0, min_id=0
@@ -2319,6 +2341,7 @@ async def cmd_draft(cli, args) -> None:
         dry_run(args, plan, "DRY RUN — draft untouched. Re-run with --yes to write it.")
         return
 
+    stop_typing(entity.id)
     await cli(
         SaveDraftRequest(
             peer=entity,
@@ -2653,6 +2676,7 @@ async def cmd_poll(cli, args) -> None:
     if not args.yes:
         dry_run(args, plan, "DRY RUN — nothing sent. Re-run with --yes to actually deliver.")
         return
+    stop_typing(entity.id)
     msg = await cli.send_file(entity, media, reply_to=send_reply_to(args.reply_to, topic["id"] if topic else None))
     result(args, {**plan, "dry_run": False, "message_id": msg.id}, f"poll sent: message_id={msg.id}")
 
@@ -2671,6 +2695,8 @@ async def cmd_listen(cli, args) -> None:
     tool call cannot be interrupted.
     """
     chats = [await resolve(cli, ref) for ref in args.chat or []]
+    for chat_id in sorted(tagged_ids(args.tag) or []):
+        chats.append(await resolve(cli, str(chat_id)))
     me = await cli.get_me()
     timeout = args.timeout
     if timeout is None and args.count is None and IN_MCP:
@@ -2766,6 +2792,591 @@ async def cmd_export(cli, args) -> None:
     )
 
 
+# --- internal tags: labels Telegram does not have to know about -------------
+#
+# Telegram's own per-chat tags are folders shown as chips, and the chips need
+# Premium. These are ELBoT's: a label like "client" or "family" on any chat,
+# kept beside the alias book (so they travel with the private repo) and used to
+# filter `catchup`, `chats`, `mentions`, `listen` and the watcher. They cost
+# nothing, need no account feature, and nobody else can see them.
+
+TAGS_FILE = SKILL_DIR / "tags.json"
+_TAG_NAME = re.compile(r"[^\s,]{1,32}")
+
+
+def load_tags() -> dict[str, dict[str, str]]:
+    """{tag: {chat id: label at tagging time}}, tags lowercase."""
+    raw = read_json(TAGS_FILE)
+    return {str(k).lower(): {str(i): str(n) for i, n in (v or {}).items()} for k, v in raw.items()}
+
+
+def save_tags(tags: dict) -> None:
+    clean = {k: dict(sorted(v.items())) for k, v in sorted(tags.items()) if v}
+    TAGS_FILE.write_text(json.dumps(clean, ensure_ascii=False, indent=2) + "\n")
+
+
+def tag_name(raw: str) -> str:
+    name = raw.strip().lower().lstrip("#")
+    if not _TAG_NAME.fullmatch(name):
+        die(f"a tag is one word of up to 32 characters, got {raw!r}")
+    return name
+
+
+def tagged_ids(names: list[str] | None, strict: bool = True) -> set[int] | None:
+    """The chat ids carrying any of these tags; None when no tag was asked for.
+
+    An unknown tag stops a command (a typo would otherwise filter everything
+    out and look like "nothing unread"); the watcher passes strict=False, so
+    one rule naming a tag nobody has used yet does not stop the others.
+    """
+    if not names:
+        return None
+    tags = load_tags()
+    out: set[int] = set()
+    for raw in names:
+        name = tag_name(raw)
+        if name not in tags:
+            if strict:
+                die(f"no tag called {name!r}. Run `tag` to list them.")
+            print(f"topoli-user: warning: no chat is tagged #{name} yet", file=sys.stderr)
+            continue
+        out |= {int(i) for i in tags[name]}
+    return out
+
+
+def tags_of(chat_id: int) -> list[str]:
+    return sorted(name for name, chats in load_tags().items() if str(chat_id) in chats)
+
+
+async def cmd_tag(cli, args) -> None:
+    """Label chats with ELBoT's own tags, list them, or list a tag's chats.
+
+    No dry run: a tag lives only in tags.json and nobody else ever sees it.
+    """
+    tags = load_tags()
+
+    if args.delete:
+        name = tag_name(args.delete)
+        if tags.pop(name, None) is None:
+            die(f"no tag called {name!r}")
+        save_tags(tags)
+        result(args, {"deleted": name}, f"deleted tag {name!r}")
+        return
+
+    if args.chat:
+        entities = [await resolve(cli, ref) for ref in args.chat]
+        for name in map(tag_name, args.add or []):
+            for e in entities:
+                tags.setdefault(name, {})[str(e.id)] = label(e)
+        for name in map(tag_name, args.remove or []):
+            for e in entities:
+                tags.get(name, {}).pop(str(e.id), None)
+        if args.add or args.remove:
+            save_tags(tags)
+        rows = [{**entity_row(e), "tags": tags_of(e.id)} for e in entities]
+        if emit(rows, args):
+            return
+        for r in rows:
+            print(f"{r['id']:>16}  {r['title']}  " + (" ".join(f"#{t}" for t in r["tags"]) or "(no tags)"))
+        return
+
+    if args.name:
+        name = tag_name(args.name)
+        chats = [{"id": int(i), "title": n} for i, n in tags.get(name, {}).items()]
+        if emit({"tag": name, "chats": chats}, args):
+            return
+        for c in chats:
+            print(f"{c['id']:>16}  {c['title']}")
+        print(f"\n-- {len(chats)} chat(s) tagged #{name}", file=sys.stderr)
+        return
+
+    listing = [{"tag": k, "chats": len(v)} for k, v in sorted(tags.items())]
+    if emit(listing, args):
+        return
+    for row in listing:
+        print(f"#{row['tag']:<20} {row['chats']} chat(s)")
+    print(f"\n-- {len(listing)} tag(s) in {TAGS_FILE}", file=sys.stderr)
+
+
+# --- typing: let the other side see that a reply is being written ----------
+
+#: chat id -> the task that keeps "typing…" alive there. Only the MCP server
+#: and the watcher live long enough to hold one.
+_TYPING: dict[int, asyncio.Task] = {}
+
+TYPING_ACTIONS = ("typing", "record-audio", "record-video", "photo", "document", "choose-sticker")
+
+
+async def _keep_typing(cli, entity, action: str, seconds: float) -> None:
+    try:
+        async with cli.action(entity, action):
+            await asyncio.sleep(seconds)
+    finally:
+        _TYPING.pop(entity.id, None)
+
+
+def stop_typing(chat_id: int) -> bool:
+    """Stop a background "typing…" in this chat; true if one was running."""
+    task = _TYPING.pop(chat_id, None)
+    if task is None:
+        return False
+    task.cancel()
+    return True
+
+
+async def cmd_typing(cli, args) -> None:
+    """Show "typing…" (or another action) in a chat while a reply is composed.
+
+    Under the MCP server it starts in the background and returns at once, so an
+    agent can call it, read the thread and write its reply while the other side
+    sees it typing; a `send`, `send-file`, `poll` or `draft` to the same chat
+    stops it, and so does --stop or the time running out. From the shell it
+    simply types for --seconds and returns. Telegram itself drops the
+    indicator after about five seconds unless it is renewed, so nothing lingers
+    if the process dies.
+    """
+    entity = await resolve(cli, args.chat)
+    if args.stop:
+        stopped = stop_typing(entity.id)
+        if not stopped:
+            await cli.action(entity, "cancel")
+        result(args, {"chat": entity_row(entity), "typing": False}, f"stopped typing in {label(entity)}")
+        return
+    seconds = max(1, min(args.seconds, 300))
+    if IN_MCP:
+        stop_typing(entity.id)
+        _TYPING[entity.id] = asyncio.create_task(_keep_typing(cli, entity, args.action, seconds))
+        result(
+            args,
+            {"chat": entity_row(entity), "typing": True, "action": args.action, "seconds": seconds},
+            f"{args.action} in {label(entity)} for up to {seconds}s",
+        )
+        return
+    say(args, f"{args.action} in {label(entity)} for {seconds}s")
+    await _keep_typing(cli, entity, args.action, seconds)
+    result(args, {"chat": entity_row(entity), "typing": False, "seconds": seconds})
+
+
+# --- scheduled messages and reminders ----------------------------------------
+
+
+def parse_at(at: str | None, after: str | None) -> datetime:
+    """--at an ISO time, or --in a duration from now; exactly one."""
+    if bool(at) == bool(after):
+        die("give exactly one of --at 2026-11-12T09:00 or --in 2h")
+    if after:
+        return datetime.now(UTC) + parse_duration(after)
+    when = parse_when(at, "--at")
+    assert when is not None
+    if when <= datetime.now(UTC):
+        die(f"--at {at} is in the past")
+    return when
+
+
+async def cmd_scheduled(cli, args) -> None:
+    """List a chat's scheduled messages, cancel some, or send them now.
+
+    `send --schedule` and `remind` hand delivery to Telegram; this is the
+    other half — seeing what is queued and taking it back. Cancelling or
+    sending early is a dry run until --yes, like every other write.
+    """
+    entity = await resolve(cli, args.chat)
+    res = await cli(GetScheduledHistoryRequest(peer=entity, hash=0))
+    msgs = sorted(getattr(res, "messages", []), key=lambda m: m.date)
+    rows: list[dict] = [{"id": m.id, "date": ts(m.date), "text": body(m), "media": media_row(m)} for m in msgs]
+
+    target = args.cancel or args.now
+    if not target:
+        if emit({**entity_row(entity), "scheduled": rows}, args):
+            return
+        for r in rows:
+            print(f"{r['id']:>8}  {r['date']}  {r['text'][:160]}")
+        print(f"\n-- {len(rows)} scheduled in {label(entity)}", file=sys.stderr)
+        return
+
+    known = {r["id"]: r for r in rows}
+    missing = [i for i in target if i not in known]
+    if missing:
+        die(f"not scheduled in {label(entity)}: {', '.join(map(str, missing))}. Run `scheduled --chat …` to list them.")
+    verb = "cancel" if args.cancel else "send now"
+    say(args, f"about to {verb} in {label(entity)}:")
+    for i in target:
+        say(args, f"  - {i} [{known[i]['date']}] {known[i]['text'][:120]}")
+    plan = {"chat": entity_row(entity), "action": verb, "messages": [known[i] for i in target]}
+    if not args.yes:
+        dry_run(args, plan, "DRY RUN — nothing changed. Re-run with --yes to apply.")
+        return
+    if args.cancel:
+        await cli(DeleteScheduledMessagesRequest(peer=entity, id=target))
+    else:
+        await cli(SendScheduledMessagesRequest(peer=entity, id=target))
+    result(args, {**plan, "dry_run": False}, f"{'cancelled' if args.cancel else 'sent'}: {len(target)} message(s)")
+
+
+async def cmd_remind(cli, args) -> None:
+    """A reminder: a message Telegram delivers to Saved Messages later.
+
+    A scheduled message to yourself arrives as a "Reminder" with a
+    notification on every device — Telegram's own reminder feature, with no
+    process kept alive. To Saved Messages it needs no --yes (nobody else sees
+    it); `--chat` someone else makes it an ordinary scheduled send, which does.
+    """
+    entity = await resolve(cli, args.chat)
+    me = await cli.get_me()
+    when = parse_at(args.at, getattr(args, "in_", None))
+    text, entities = build_message(message_text(args), args.parse, args.quote, args.expandable)
+    self_only = entity.id == me.id
+    plan = {"chat": entity_row(entity), "when": ts(when), "text": text, "reminder": self_only}
+    say(args, f"{'reminder' if self_only else 'scheduled send'} to {label(entity)} at {ts(when)}: {text}")
+    if not self_only and not args.yes:
+        dry_run(args, plan, "DRY RUN — it goes to someone else, so re-run with --yes to schedule it.")
+        return
+    msg = await cli.send_message(entity, text, formatting_entities=entities or None, parse_mode=None, schedule=when)
+    result(
+        args,
+        {**plan, "dry_run": False, "message_id": msg.id},
+        f"{'reminder' if self_only else 'scheduled'}: {ts(when)} (id {msg.id}; `scheduled` lists or cancels it)",
+    )
+
+
+# --- read receipts -----------------------------------------------------------
+
+
+async def cmd_receipts(cli, args) -> None:
+    """Who has read one of Parham's messages, and when.
+
+    A private chat answers with the read date when the other side's privacy
+    allows it (and whether it was read at all regardless). A group answers
+    with every member who read it — Telegram keeps that only for groups of up
+    to 100 members and for seven days after the message.
+    """
+    entity = await resolve(cli, args.chat)
+    msgs = await cli.get_messages(entity, ids=[args.message])
+    msg = msgs[0] if msgs else None
+    if msg is None:
+        die(f"message {args.message} not found in {label(entity)}")
+    me = await cli.get_me()
+    if msg.sender_id != me.id:
+        die(f"message {args.message} is not yours — receipts exist only for what you sent")
+
+    row: dict = {"chat": entity_row(entity), "message_id": args.message, "sent": ts(msg.date)}
+    if isinstance(entity, User):
+        peers = await cli(GetPeerDialogsRequest(peers=[InputDialogPeer(await cli.get_input_entity(entity))]))
+        read_max = peers.dialogs[0].read_outbox_max_id if peers.dialogs else 0
+        row["read"] = args.message <= read_max
+        row["read_at"] = None
+        if row["read"]:
+            with contextlib.suppress(errors.RPCError):  # hidden by their privacy settings, or too old
+                res = await cli(GetOutboxReadDateRequest(peer=entity, msg_id=args.message))
+                row["read_at"] = ts(res.date)
+        text = f"{'read' if row['read'] else 'not read yet'}" + (f" at {row['read_at']}" if row["read_at"] else "")
+    else:
+        try:
+            res = await cli(GetMessageReadParticipantsRequest(peer=entity, msg_id=args.message))
+        except errors.RPCError as exc:
+            if "EXPIRED" in str(exc).upper() or "chat_read_mark_expire_period" in str(exc):
+                die("read receipts in groups expire after 7 days, and this message is older")
+            if "TOO_BIG" in str(exc).upper():
+                die("Telegram keeps read receipts only in groups of up to 100 members")
+            die(f"no read receipts for this message: {exc}")
+        readers = []
+        for p in res:
+            uid = getattr(p, "user_id", p)
+            name = str(uid)
+            with contextlib.suppress(ValueError, errors.RPCError):
+                name = label(await cli.get_entity(uid))
+            readers.append({"id": uid, "name": name, "date": ts(getattr(p, "date", None))})
+        row["readers"] = readers
+        text = "\n".join(f"{r['date']}  {r['name']}" for r in readers) or "nobody has read it yet"
+    result(args, row, text)
+
+
+# --- the watcher: standing rules on incoming messages ------------------------
+#
+# `listen` prints what arrives; `watch` decides what to do about it, unattended,
+# from rules written down in advance. A rule names what it matches (chats,
+# tags, senders, words, a mention of Parham) and what to do: a desktop
+# notification, a reaction, a line in a log, a forward, a command to run, or
+# marking the chat read. Writing the rule is the authorisation for its
+# actions — the same standing-instruction model as the morning standup — so a
+# rule that reacts or forwards does it without asking, and `watch --check`
+# shows exactly what each rule will do before it is left running.
+
+WATCH_FILE = SKILL_DIR / "watch.json"
+RULE_KEYS = {
+    "name",
+    "accounts",
+    "chats",
+    "tags",
+    "from",
+    "keywords",
+    "regex",
+    "mentions",
+    "incoming",
+    "private",
+    "actions",
+}
+ACTION_KEYS = {"notify", "react", "log", "forward", "exec", "mark_read"}
+
+
+def load_rules(path: Path | None = None) -> list[dict]:
+    """The rules that apply to this account, validated; dies on a bad file."""
+    path = path or WATCH_FILE
+    if not path.is_file():
+        die(f"no rules at {path}. Write one; see `watch --example`.")
+    try:
+        raw = json.loads(path.read_text())
+    except json.JSONDecodeError as exc:
+        die(f"{path} is not valid JSON: {exc}")
+    rules = raw.get("rules", []) if isinstance(raw, dict) else raw
+    out = []
+    for i, rule in enumerate(rules):
+        where = f"rule {i} ({rule.get('name', 'unnamed')})"
+        unknown = set(rule) - RULE_KEYS
+        if unknown:
+            die(f"{where}: unknown keys {sorted(unknown)}; allowed: {sorted(RULE_KEYS)}")
+        actions = rule.get("actions") or []
+        if not actions:
+            die(f"{where}: no actions")
+        for action in actions:
+            bad = set(action) - ACTION_KEYS
+            if bad:
+                die(f"{where}: unknown action {sorted(bad)}; allowed: {sorted(ACTION_KEYS)}")
+        if rule.get("regex"):
+            try:
+                re.compile(rule["regex"])
+            except re.error as exc:
+                die(f"{where}: bad regex: {exc}")
+        accounts = rule.get("accounts")
+        if accounts and ACCOUNT not in accounts:
+            continue
+        out.append({**rule, "name": rule.get("name") or f"rule {i}"})
+    return out
+
+
+WATCH_EXAMPLE = {
+    "rules": [
+        {
+            "name": "family",
+            "accounts": ["parham"],
+            "chats": ["wife"],
+            "actions": [{"notify": True}],
+        },
+        {
+            "name": "clients asking",
+            "tags": ["client"],
+            "keywords": ["urgent", "فوری", "asap"],
+            "actions": [{"notify": True}, {"react": "👀"}, {"log": "~/.local/state/automated-topoli/clients.jsonl"}],
+        },
+        {
+            "name": "mentioned in a group",
+            "mentions": True,
+            "actions": [{"notify": True}, {"forward": "me"}],
+        },
+        {
+            "name": "iranian account to main",
+            "accounts": ["topoli"],
+            "private": True,
+            "actions": [{"exec": "jq -r .text >> ~/iran-inbox.txt"}],
+        },
+    ]
+}
+
+
+class Watched:
+    """What a rule is matched against: one message and where it came from."""
+
+    def __init__(
+        self, row: dict, chat_id: int, chat_title: str, private: bool, mentioned: bool, sender_names: list[str]
+    ):
+        self.row = row
+        self.chat_id = chat_id
+        self.chat_title = chat_title
+        self.private = private
+        self.mentioned = mentioned
+        self.sender_names = [n.lower() for n in sender_names]
+
+
+def rule_matches(rule: dict, w: Watched, chat_ids: set[int] | None, tag_ids: set[int] | None) -> bool:
+    """Every condition the rule names must hold; within one, any value will do.
+
+    `chat_ids` and `tag_ids` are the rule's chats and tags already resolved to
+    ids (None when the rule names none), so this stays pure and testable.
+    """
+    if rule.get("incoming", True) and w.row.get("outgoing"):
+        return False
+    if chat_ids is not None and w.chat_id not in chat_ids:
+        return False
+    if tag_ids is not None and w.chat_id not in tag_ids:
+        return False
+    if "private" in rule and bool(rule["private"]) != w.private:
+        return False
+    if rule.get("mentions") and not w.mentioned:
+        return False
+    senders = [str(s).lower().lstrip("@") for s in rule.get("from") or []]
+    if senders and not any(s in name for s in senders for name in w.sender_names):
+        return False
+    text = (w.row.get("text") or "").casefold()
+    words = [str(k).casefold() for k in rule.get("keywords") or []]
+    if words and not any(k in text for k in words):
+        return False
+    return not (rule.get("regex") and not re.search(rule["regex"], w.row.get("text") or "", re.IGNORECASE))
+
+
+def desktop_notify(title: str, text: str) -> None:
+    """A notification on this machine: osascript on macOS, notify-send on Linux."""
+    title, text = title[:80], text[:240]
+    if sys.platform == "darwin":
+        script = f"display notification {json.dumps(text)} with title {json.dumps(title)}"
+        cmd = ["osascript", "-e", script]
+    else:
+        cmd = ["notify-send", "--app-name=ELBoT", title, text]
+    with contextlib.suppress(OSError):
+        import subprocess
+
+        subprocess.Popen(cmd, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+
+
+async def run_actions(cli, rule: dict, msg, w: Watched, dry: bool) -> list[str]:
+    """Carry out a matched rule's actions; return what was done, for the log."""
+    done = []
+    for action in rule["actions"]:
+        for kind_, value in action.items():
+            if not value:
+                continue
+            what = f"{kind_}={value}" if value is not True else kind_
+            done.append(what)
+            if dry:
+                continue
+            try:
+                if kind_ == "notify":
+                    desktop_notify(f"{w.row['sender']} — {w.chat_title}", w.row["text"])
+                elif kind_ == "react":
+                    await cli(
+                        SendReactionRequest(peer=msg.peer_id, msg_id=msg.id, reaction=[ReactionEmoji(emoticon=value)])
+                    )
+                elif kind_ == "log":
+                    path = Path(str(value)).expanduser()
+                    path.parent.mkdir(parents=True, exist_ok=True)
+                    with path.open("a") as fh:
+                        fh.write(
+                            json.dumps(
+                                {**w.row, "chat": w.chat_title, "chat_id": w.chat_id, "rule": rule["name"]},
+                                ensure_ascii=False,
+                                default=str,
+                            )
+                            + "\n"
+                        )
+                elif kind_ == "forward":
+                    await cli.forward_messages(await resolve(cli, str(value)), msg.id, msg.peer_id)
+                elif kind_ == "mark_read":
+                    await cli.send_read_acknowledge(msg.peer_id, max_id=msg.id)
+                elif kind_ == "exec":
+                    payload = json.dumps(
+                        {**w.row, "chat": w.chat_title, "chat_id": w.chat_id, "rule": rule["name"]},
+                        ensure_ascii=False,
+                        default=str,
+                    )
+                    proc = await asyncio.create_subprocess_shell(
+                        str(value),
+                        stdin=asyncio.subprocess.PIPE,
+                        stdout=asyncio.subprocess.DEVNULL,
+                        stderr=asyncio.subprocess.DEVNULL,
+                        env={
+                            **os.environ,
+                            "ELBOT_RULE": rule["name"],
+                            "ELBOT_CHAT": w.chat_title,
+                            "ELBOT_TEXT": w.row["text"],
+                        },
+                    )
+                    await proc.communicate(payload.encode())
+            except (errors.RPCError, OSError, ValueError, SystemExit) as exc:
+                print(f"  ! {rule['name']}: {kind_} failed: {exc}", file=sys.stderr)
+    return done
+
+
+async def cmd_watch(cli, args) -> None:
+    """Run the standing rules in watch.json against every incoming message.
+
+    `--check` validates the rules and resolves their chats and tags, without
+    listening; `--dry` listens and logs what each rule *would* do; `--example`
+    prints a starting rules file. It runs until stopped (or --timeout), so it
+    belongs in a systemd or launchd unit, like the standup timer.
+    """
+    if args.example:
+        print(json.dumps(WATCH_EXAMPLE, ensure_ascii=False, indent=2))
+        return
+    rules = load_rules(Path(args.rules).expanduser() if args.rules else None)
+
+    resolved: list[tuple[dict, set[int] | None, set[int] | None]] = []
+    for rule in rules:
+        chat_ids = {(await resolve(cli, str(c))).id for c in rule["chats"]} if rule.get("chats") else None
+        tag_ids = tagged_ids(rule.get("tags"), strict=False)
+        resolved.append((rule, chat_ids, tag_ids))
+        actions = ", ".join(k if v is True else f"{k}={v}" for a in rule["actions"] for k, v in a.items())
+        scope = (
+            "every chat"
+            if chat_ids is None and tag_ids is None
+            else f"{len((chat_ids or set()) | (tag_ids or set()))} chat(s)"
+        )
+        say(args, f"rule {rule['name']!r}: {scope} → {actions}")
+
+    if args.check:
+        result(
+            args, {"account": ACCOUNT, "rules": [r["name"] for r in rules], "valid": True}, f"{len(rules)} rule(s) OK"
+        )
+        return
+
+    me = await cli.get_me()
+    queue: asyncio.Queue = asyncio.Queue()
+
+    async def on_message(event) -> None:
+        await queue.put(event.message)
+
+    builder = events.NewMessage()
+    cli.add_event_handler(on_message, builder)
+    say(args, f"watching as {label(me)} with {len(rules)} rule(s){' (dry run)' if args.dry else ''}")
+    loop = asyncio.get_running_loop()
+    deadline = loop.time() + args.timeout if args.timeout else None
+    try:
+        while True:
+            wait = None if deadline is None else deadline - loop.time()
+            if wait is not None and wait <= 0:
+                break
+            try:
+                msg = await asyncio.wait_for(queue.get(), timeout=wait)
+            except TimeoutError:
+                break
+            chat = await msg.get_chat()
+            sender = await msg.get_sender()
+            row = msg_row(msg, me.id)
+            names = [label(sender)] if sender else []
+            if sender is not None and getattr(sender, "username", None):
+                names.append(sender.username)
+            w = Watched(
+                row, chat.id, label(chat), isinstance(chat, User), bool(getattr(msg, "mentioned", False)), names
+            )
+            for rule, chat_ids, tag_ids in resolved:
+                if rule_matches(rule, w, chat_ids, tag_ids):
+                    done = await run_actions(cli, rule, msg, w, args.dry)
+                    line = {
+                        "rule": rule["name"],
+                        "chat": w.chat_title,
+                        "message_id": row["id"],
+                        "did": done,
+                        "dry": args.dry,
+                    }
+                    if getattr(args, "json", False):
+                        print(json.dumps(line, ensure_ascii=False), flush=True)
+                    else:
+                        print(
+                            f"[{row['date']}] {rule['name']}: {w.chat_title} — {row['sender']} → {', '.join(done)}",
+                            flush=True,
+                        )
+    finally:
+        cli.remove_event_handler(on_message, builder)
+
+
 # --------------------------------------------------------------------------
 # AI interface: the command line as tools, over MCP or as a JSON schema
 # --------------------------------------------------------------------------
@@ -2781,7 +3392,7 @@ async def cmd_export(cli, args) -> None:
 
 #: Commands that make no sense as a tool: login is interactive by nature, and
 #: the server cannot serve itself.
-NOT_TOOLS = {"setup", "login", "mcp", "schema", "accounts"}
+NOT_TOOLS = {"setup", "login", "mcp", "schema", "accounts", "watch"}
 
 MCP_PROTOCOLS = ("2025-06-18", "2025-03-26", "2024-11-05")
 
@@ -2799,6 +3410,11 @@ matches several chats the call fails with the candidates — ask which one; neve
 - Start with `catchup` (unread), `mentions` (unread @mentions) or `chats`; read a thread with `history`, a \
 specific message with `get`, a voice note with `transcribe`. `listen` waits for new messages (bounded to 60s \
 unless `timeout`/`count` is given).
+- When you start working on a reply for a chat, call `typing` for it first: the other side sees "typing…" while \
+you read and write, and it stops by itself when you send or draft there, or after `seconds`.
+- `tag` holds the user's own labels on chats (client, family, …); `catchup`, `chats`, `mentions` and `listen` \
+take `tag` to filter by them. Reminders: `remind` (Saved Messages, delivered by Telegram), listed and cancelled \
+with `scheduled`. `receipts` says who read a message.
 - Message text uses Telegram markdown: **bold**, __italic__, ~~strike~~, ||spoiler||, `code`, ```lang fences, \
 [label](url), and lines starting with > as a quote. Single * and _ are literal. Pass parse="none" for logs.
 """
@@ -2952,6 +3568,152 @@ async def call_tool(cli, parser: argparse.ArgumentParser, name: str, arguments: 
     return {"content": content, "isError": failed}
 
 
+# --- MCP prompts and resources ------------------------------------------------
+#
+# Tools are verbs; prompts are the errands a person actually asks for ("what
+# did I miss", "answer my wife"), written once with the order of tool calls and
+# the rules that make them safe, so the client can offer them as slash
+# commands. Resources are the nouns an agent reads without deciding to call a
+# tool: the unread list, the mentions, the drafts, a chat's recent history.
+
+#: name -> (title, description, [(argument, description, required)], template)
+MCP_PROMPTS: dict[str, tuple[str, str, list[tuple[str, str, bool]], str]] = {
+    "triage": (
+        "Triage my Telegram",
+        "Go through everything unread and the @mentions, sorted by what needs Parham.",
+        [("tag", "only chats with this ELBoT tag, e.g. client", False)],
+        "Triage my Telegram{tag_clause}. Call `catchup`{tag_arg} and `mentions`{tag_arg}. Group what you find into: "
+        "needs a reply from me, FYI, and noise. For each chat that needs me, say who, what they want, since when, and "
+        "propose a short reply in my voice (match the language and tone I use in that chat; read my earlier messages "
+        "with `history` if unsure). Do not send or mark anything read. Offer to put the replies in as drafts with "
+        "`draft` — they wait in the input box for me to send.",
+    ),
+    "reply": (
+        "Reply to a chat",
+        "Read a conversation, show typing, and draft a reply for approval.",
+        [
+            ("chat", "who to answer: alias, @username, id or title", True),
+            ("intent", "what the reply should say", False),
+        ],
+        "Reply to {chat} on Telegram{intent_clause}. First call `typing` for {chat} so they see me typing while you "
+        "work. Read the recent thread with `history` (limit 30) and anything it points to with `get`. Write the reply "
+        "in my voice — same language, length and register as my earlier messages there, no assistant phrasing. Show "
+        "it to me with the `send` dry run (no `yes`), and only send after I agree; if I am unsure, use `draft`.",
+    ),
+    "summarize": (
+        "Summarize a chat",
+        "What happened in a chat or group over a period.",
+        [("chat", "alias, @username, id or title", True), ("since", "ISO date to start from, e.g. 2026-11-01", False)],
+        "Summarize the Telegram chat {chat}{since_clause}. Use `history` with --since (raise the limit until the "
+        "period is covered) and `transcribe` on voice notes that matter. Give: the decisions made, open questions, "
+        "what was asked of me and whether I answered, and dates. Quote short lines in their original language.",
+    ),
+    "waiting": (
+        "Who is waiting on me",
+        "Private chats where the last message is theirs and unanswered.",
+        [("tag", "only chats with this ELBoT tag", False)],
+        "Find who is waiting on me on Telegram{tag_clause}. Call `chats` (limit 100){tag_arg} and, for each private "
+        "chat whose last message is not mine, read the tail with `history`. List them oldest first with how long "
+        "they have waited and what they asked. Use `receipts` on my last message where it matters. Send nothing.",
+    ),
+    "remind": (
+        "Remind me",
+        "Turn a request into a Telegram reminder in Saved Messages.",
+        [("what", "what to be reminded of", True), ("when", "when, e.g. tomorrow 9:00 or in 2h", True)],
+        "Set a Telegram reminder: {what} — {when}. Work out the exact local time (Europe/Madrid unless I say "
+        "otherwise), then call `remind` with `at` (ISO) or `in` (30m, 2h, 1d). Confirm the time back to me; "
+        "`scheduled` lists reminders and cancels them.",
+    ),
+}
+
+
+def prompt_specs() -> list[dict]:
+    return [
+        {
+            "name": name,
+            "title": title,
+            "description": desc,
+            "arguments": [{"name": a, "description": d, "required": r} for a, d, r in params],
+        }
+        for name, (title, desc, params, _) in MCP_PROMPTS.items()
+    ]
+
+
+def render_prompt(name: str, arguments: dict) -> dict:
+    """prompts/get: the template filled in, as one user message."""
+    if name not in MCP_PROMPTS:
+        raise ValueError(f"unknown prompt {name!r}")
+    title, _, params, template = MCP_PROMPTS[name]
+    for arg, _, required in params:
+        if required and not (arguments or {}).get(arg):
+            raise ValueError(f"prompt {name!r} needs {arg!r}")
+    a = {k: str(v) for k, v in (arguments or {}).items() if v}
+    fields = {
+        "chat": a.get("chat", ""),
+        "what": a.get("what", ""),
+        "when": a.get("when", ""),
+        "tag_clause": f" for chats tagged #{a['tag']}" if a.get("tag") else "",
+        "tag_arg": f" with tag={a['tag']!r}" if a.get("tag") else "",
+        "intent_clause": f"; the gist: {a['intent']}" if a.get("intent") else "",
+        "since_clause": f" since {a['since']}" if a.get("since") else " over the last week",
+    }
+    return {
+        "description": title,
+        "messages": [{"role": "user", "content": {"type": "text", "text": template.format(**fields)}}],
+    }
+
+
+#: uri -> (name, description, tool, arguments)
+MCP_RESOURCES: dict[str, tuple[str, str, str, dict]] = {
+    "telegram://unread": ("Unread", "Everything unread, per chat (catchup)", "catchup", {}),
+    "telegram://mentions": ("Mentions", "Unread @mentions and replies to me", "mentions", {}),
+    "telegram://drafts": ("Drafts", "Replies waiting in input boxes", "draft", {}),
+    "telegram://tags": ("Tags", "ELBoT's chat tags", "tag", {}),
+    "telegram://aliases": ("Aliases", "Named chats", "alias", {}),
+    "telegram://reminders": ("Reminders", "Scheduled messages in Saved Messages", "scheduled", {"chat": "me"}),
+    "telegram://me": ("Account", "Who this server acts as, and its device name", "whoami", {}),
+}
+
+#: uriTemplate -> (name, description, tool, argument builder)
+MCP_RESOURCE_TEMPLATES: dict[str, tuple[str, str, str, Callable[[dict], dict]]] = {
+    "telegram://chat/{chat}": (
+        "Chat history",
+        "The last 50 messages of a chat",
+        "history",
+        lambda v: {"chat": v["chat"]},
+    ),
+    "telegram://chat/{chat}/info": ("Chat info", "Bio, members, last seen", "info", lambda v: {"chat": v["chat"]}),
+    "telegram://tag/{tag}/unread": (
+        "Unread by tag",
+        "Unread in chats with a tag",
+        "catchup",
+        lambda v: {"tag": [v["tag"]]},
+    ),
+}
+
+
+def resource_call(uri: str) -> tuple[str, dict]:
+    """The tool call a resource URI stands for."""
+    if uri in MCP_RESOURCES:
+        _, _, tool, arguments = MCP_RESOURCES[uri]
+        return tool, dict(arguments)
+    for template, (_, _, tool, build) in MCP_RESOURCE_TEMPLATES.items():
+        pattern = "^" + re.sub(r"\\{(\w+)\\}", r"(?P<\1>[^/]+)", re.escape(template)) + "$"
+        m = re.match(pattern, uri)
+        if m:
+            values = {k: unquote(v) for k, v in m.groupdict().items()}
+            return tool, build(values)
+    raise ValueError(f"unknown resource {uri!r}")
+
+
+async def read_resource(cli, parser, uri: str) -> dict:
+    tool, arguments = resource_call(uri)
+    res = await call_tool(cli, parser, tool, arguments)
+    if res["isError"]:
+        raise ValueError(" ".join(c["text"] for c in res["content"]))
+    return {"contents": [{"uri": uri, "mimeType": "application/json", "text": res["content"][0]["text"]}]}
+
+
 async def mcp_handle(cli, parser, specs: list[dict], msg: dict) -> dict | None:
     """One JSON-RPC message in, the response out (None for a notification)."""
     method, rid, params = msg.get("method"), msg.get("id"), msg.get("params") or {}
@@ -2961,7 +3723,11 @@ async def mcp_handle(cli, parser, specs: list[dict], msg: dict) -> dict | None:
         asked = params.get("protocolVersion")
         res: dict = {
             "protocolVersion": asked if asked in MCP_PROTOCOLS else MCP_PROTOCOLS[0],
-            "capabilities": {"tools": {"listChanged": False}},
+            "capabilities": {
+                "tools": {"listChanged": False},
+                "prompts": {"listChanged": False},
+                "resources": {"listChanged": False, "subscribe": False},
+            },
             "serverInfo": {"name": "elbot", "title": "ELBoT — Telegram secretary", "version": VERSION},
             "instructions": MCP_INSTRUCTIONS,
         }
@@ -2971,6 +3737,30 @@ async def mcp_handle(cli, parser, specs: list[dict], msg: dict) -> dict | None:
         res = {"tools": specs}
     elif method == "tools/call":
         res = await call_tool(cli, parser, params.get("name", ""), params.get("arguments") or {})
+    elif method in ("prompts/list", "resources/list", "resources/templates/list", "prompts/get", "resources/read"):
+        try:
+            if method == "prompts/list":
+                res = {"prompts": prompt_specs()}
+            elif method == "prompts/get":
+                res = render_prompt(params.get("name", ""), params.get("arguments") or {})
+            elif method == "resources/list":
+                res = {
+                    "resources": [
+                        {"uri": uri, "name": name, "description": desc, "mimeType": "application/json"}
+                        for uri, (name, desc, _, _) in MCP_RESOURCES.items()
+                    ]
+                }
+            elif method == "resources/templates/list":
+                res = {
+                    "resourceTemplates": [
+                        {"uriTemplate": uri, "name": name, "description": desc, "mimeType": "application/json"}
+                        for uri, (name, desc, _, _) in MCP_RESOURCE_TEMPLATES.items()
+                    ]
+                }
+            else:
+                res = await read_resource(cli, parser, params.get("uri", ""))
+        except ValueError as exc:
+            return {"jsonrpc": "2.0", "id": rid, "error": {"code": -32602, "message": str(exc)}}
     else:
         return {"jsonrpc": "2.0", "id": rid, "error": {"code": -32601, "message": f"method not found: {method}"}}
     return {"jsonrpc": "2.0", "id": rid, "result": res}
@@ -3085,6 +3875,7 @@ def build_parser() -> argparse.ArgumentParser:
     sp = add_json(sub.add_parser("chats", help="list conversations with their MTProto ids"))
     sp.add_argument("--limit", type=int, default=50)
     sp.add_argument("--unread", action="store_true", help="only chats with unread messages")
+    sp.add_argument("--tag", action="append", help="only chats with this ELBoT tag; repeatable")
     sp.set_defaults(fn=cmd_chats)
 
     sp = add_json(sub.add_parser("contacts", help="the saved address book — far faster than scanning chats"))
@@ -3095,6 +3886,7 @@ def build_parser() -> argparse.ArgumentParser:
     sp.add_argument("--limit", type=int, default=100, help="how many chats to scan")
     sp.add_argument("--max-per-chat", type=int, default=20, help="cap the messages shown per chat")
     sp.add_argument("--read", action="store_true", help="mark them read afterwards (the other side sees this)")
+    sp.add_argument("--tag", action="append", help="only chats with this ELBoT tag; repeatable")
     sp.set_defaults(fn=cmd_catchup)
 
     sp = add_json(sub.add_parser("alias", help="name a chat once, address it by that name forever"))
@@ -3251,6 +4043,7 @@ def build_parser() -> argparse.ArgumentParser:
     sp = sub.add_parser("mentions", help="unread @mentions and replies to you, across every chat")
     sp.add_argument("--limit", type=int, default=200, help="how many chats to scan")
     sp.add_argument("--max-per-chat", type=int, default=20)
+    sp.add_argument("--tag", action="append", help="only chats with this ELBoT tag; repeatable")
     sp.set_defaults(fn=cmd_mentions)
 
     sp = sub.add_parser("transcribe", help="voice or video note to text (Telegram Premium)")
@@ -3272,6 +4065,7 @@ def build_parser() -> argparse.ArgumentParser:
 
     sp = sub.add_parser("listen", help="wait for new messages and print each as it arrives")
     sp.add_argument("--chat", action="append", help="only this chat; repeatable (default: all)")
+    sp.add_argument("--tag", action="append", help="only chats with this ELBoT tag; repeatable")
     sp.add_argument("--incoming", action="store_true", help="ignore messages you send yourself")
     sp.add_argument("--count", type=int, help="stop after this many messages")
     sp.add_argument("--timeout", type=int, help="stop after this many seconds")
@@ -3346,6 +4140,53 @@ def build_parser() -> argparse.ArgumentParser:
     sp.add_argument("--topic", help=TOPIC_HELP)
     sp.add_argument("--yes", action="store_true", help="actually send (otherwise dry run)")
     sp.set_defaults(fn=cmd_poll)
+
+    # --- tags, typing, scheduling, receipts, the watcher --------------------
+    sp = sub.add_parser("tag", help="ELBoT's own chat tags: label chats, list tags, list a tag's chats")
+    sp.add_argument("--chat", action="append", help=CHAT_HELP + "; repeatable")
+    sp.add_argument("--add", action="append", help="tag to put on --chat; repeatable")
+    sp.add_argument("--remove", action="append", help="tag to take off --chat; repeatable")
+    sp.add_argument("--name", help="list the chats carrying this tag")
+    sp.add_argument("--delete", metavar="TAG", help="drop a tag from every chat")
+    sp.set_defaults(fn=cmd_tag)
+
+    sp = sub.add_parser("typing", help='show "typing…" in a chat while a reply is written')
+    sp.add_argument("--chat", required=True, help=CHAT_HELP)
+    sp.add_argument("--seconds", type=int, default=30, help="how long, at most (1-300); a send to the chat stops it")
+    sp.add_argument("--action", choices=TYPING_ACTIONS, default="typing", help="what the other side sees")
+    sp.add_argument("--stop", action="store_true", help="stop it now")
+    sp.set_defaults(fn=cmd_typing)
+
+    sp = sub.add_parser("scheduled", help="list a chat's scheduled messages; cancel or send them now")
+    sp.add_argument("--chat", default="me", help=CHAT_HELP + ' (default: "me", where reminders live)')
+    g = sp.add_mutually_exclusive_group()
+    g.add_argument(
+        "--cancel", action="append", type=int, metavar="ID", help="cancel this scheduled message; repeatable"
+    )
+    g.add_argument("--now", action="append", type=int, metavar="ID", help="send this one now; repeatable")
+    sp.add_argument("--yes", action="store_true", help="actually apply (otherwise dry run)")
+    sp.set_defaults(fn=cmd_scheduled)
+
+    sp = sub.add_parser("remind", help="a reminder in Saved Messages at a time; Telegram delivers it")
+    sp.add_argument("--chat", default="me", help='who gets it (default: "me" — a reminder)')
+    add_text(sp)
+    sp.add_argument("--at", help="ISO time, e.g. 2026-11-12T09:00 (local)")
+    sp.add_argument("--in", dest="in_", metavar="DURATION", help="from now: 30m, 2h, 1d")
+    sp.add_argument("--yes", action="store_true", help="needed only when --chat is not you")
+    sp.set_defaults(fn=cmd_remind)
+
+    sp = sub.add_parser("receipts", help="who has read one of your messages, and when")
+    sp.add_argument("--chat", required=True, help=CHAT_HELP)
+    sp.add_argument("--message", required=True, type=int, help="the id of a message you sent")
+    sp.set_defaults(fn=cmd_receipts)
+
+    sp = sub.add_parser("watch", help="run the standing rules in watch.json on every incoming message")
+    sp.add_argument("--rules", help="rules file (default: watch.json beside the script)")
+    sp.add_argument("--check", action="store_true", help="validate the rules and exit")
+    sp.add_argument("--dry", action="store_true", help="match and log, but do no action")
+    sp.add_argument("--example", action="store_true", help="print an example rules file")
+    sp.add_argument("--timeout", type=int, help="stop after this many seconds")
+    sp.set_defaults(fn=cmd_watch, cache="watch")
 
     # --- the AI interface ---------------------------------------------------
     sp = sub.add_parser("mcp", help="serve every command as an MCP tool on stdio (for Claude and other agents)")

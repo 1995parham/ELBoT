@@ -20,3 +20,5 @@ uv.lock
 .ty_cache/
 .mypy_cache/
 .pytest_cache/
+tags.json
+watch.json

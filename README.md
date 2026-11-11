@@ -22,9 +22,10 @@ uv run topoli_user.py send --chat "Some Group" --quote --text "$(cat note.txt)"
 
 | Area | Commands |
 | --- | --- |
-| Reading | `catchup`, `mentions`, `chats`, `contacts`, `history`, `get`, `search`, `topics`, `members`, `info`, `transcribe`, `download`, `export`, `listen` |
-| Writing as you (dry run until `--yes`) | `send`, `send-file`, `poll`, `edit`, `delete`, `forward`, `react`, `pin` |
-| Writing only you see | `draft`, `read` (`--unread`), `mute`, `archive`, `folder`, `folders`, `tags`, `alias` |
+| Reading | `catchup`, `mentions`, `chats`, `contacts`, `history`, `get`, `search`, `topics`, `members`, `info`, `receipts`, `transcribe`, `download`, `export`, `listen` |
+| Writing as you (dry run until `--yes`) | `send`, `send-file`, `poll`, `edit`, `delete`, `forward`, `react`, `pin`, `scheduled` |
+| Writing only you see | `draft`, `remind`, `tag`, `read` (`--unread`), `mute`, `archive`, `folder`, `folders`, `tags`, `alias` |
+| Presence and automation | `typing`, `watch` |
 | Groups and profile | `create-group`, `chat-photo`, `join`, `leave`, `profile` |
 | The session | `accounts`, `whoami`, `device`, `sessions`, `setup`, `login` |
 | AI interface | `mcp`, `schema` |
@@ -45,6 +46,38 @@ One connection stays open for the whole session, so a tool call is one round tri
 Every command takes `--json`. A read prints its rows; a write prints its plan (`"dry_run": true`) or its outcome (the new `message_id`), and the human narration moves to stderr so stdout is exactly one JSON document. Errors under `--json` are `{"error": "…"}`. Messages in JSON carry `reply_to`, `topic_id`, `forwarded`, `edited` and a `media` object (type, file name, MIME type, size, duration), so an agent can tell a 12-second voice note worth `transcribe` from a 40 MB PDF without downloading either. `--text-file` (or `--text-file -` for stdin) passes a message without shell quoting, which matters for text full of backticks, `$` and Persian.
 
 `listen` looks forward instead of back: it prints each new message as it arrives (one JSON object per line under `--json`) and stops after `--count` messages or `--timeout` seconds — the way for an agent to wait for the answer to a question it just asked. Under `mcp` it never waits longer than a minute unless told to.
+
+**Prompts and resources.** Besides the tools, the server offers MCP *prompts* — `triage` (everything unread and the mentions, sorted by what needs you, with replies proposed as drafts), `reply` (read a thread, show typing, draft an answer in your voice for approval), `summarize`, `waiting` (who is waiting on you) and `remind` — which clients show as slash commands. Its *resources* are what an agent can read without calling a tool: `telegram://unread`, `telegram://mentions`, `telegram://drafts`, `telegram://tags`, `telegram://aliases`, `telegram://reminders`, `telegram://me`, and the templates `telegram://chat/{chat}`, `telegram://chat/{chat}/info` and `telegram://tag/{tag}/unread`.
+
+**Typing while it thinks.** `typing --chat X` shows "typing…" in a chat. Under `mcp` it runs in the background and returns at once, so an agent calls it when it starts on a reply and the other side sees it typing while the agent reads the thread and writes; a `send`, `send-file`, `poll` or `draft` to that chat stops it, as do `--stop` and `--seconds` (30 by default). `--action` shows recording a voice note, choosing a sticker and so on instead.
+
+### Tags of your own
+
+Telegram's chat tags are folders shown as chips, and the chips need Premium. `tag` gives every chat labels of your own instead — free, private, kept in `tags.json` beside the script:
+
+```bash
+uv run topoli_user.py tag --chat @acme --chat "Beta Ltd" --add client
+uv run topoli_user.py tag                      # every tag and how many chats carry it
+uv run topoli_user.py tag --name client        # the chats tagged #client
+uv run topoli_user.py catchup --tag client     # also: chats, mentions, listen
+```
+
+### Reminders, scheduled messages and read receipts
+
+`remind --in 2h --text "call the bank"` (or `--at 2026-11-12T09:00`) schedules a message to Saved Messages, which Telegram delivers as a reminder with a notification on every device — no process has to stay up. `scheduled` lists what is queued in a chat (Saved Messages by default), and `--cancel ID` or `--now ID` take it back or send it early. `receipts --chat X --message N` says whether one of your messages was read: in a private chat, read or not and when (if their privacy shows it); in a group of up to 100, who read it and when, for 7 days.
+
+### The watcher
+
+`watch` runs standing rules from `watch.json` beside the script against every incoming message, for as long as it runs. A rule matches on any of `chats`, `tags`, `from`, `keywords`, `regex`, `mentions`, `private` and `accounts` (all that are named must hold) and does any of `notify` (a desktop notification), `react`, `log` (a JSON line), `forward`, `mark_read` and `exec` (a shell command with the message as JSON on stdin):
+
+```bash
+uv run topoli_user.py watch --example > watch.json   # a starting point
+uv run topoli_user.py watch --check                  # validate, resolve chats and tags, show what each rule does
+uv run topoli_user.py watch --dry --timeout 600      # match and print, act on nothing
+uv run topoli_user.py --account work watch           # for real; run it under systemd or launchd
+```
+
+Writing a rule is the authorisation for its actions, so a rule that reacts or forwards does it unattended — read `--check` before leaving it running.
 
 ### The device name
 
