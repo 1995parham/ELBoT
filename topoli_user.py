@@ -23,26 +23,43 @@ telethon on first use and needs no venv of its own.
 
 import argparse
 import asyncio
+import atexit
 import binascii
 import contextlib
+import fcntl
+import io
 import json
 import os
+import platform
+import random
 import re
 import struct
 import sys
 from collections import Counter
-from datetime import UTC, datetime
+from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from typing import NoReturn
 from urllib.parse import urlparse
 
 try:
-    from telethon import TelegramClient, errors, utils
+    from telethon import TelegramClient, errors, events, utils
     from telethon.extensions import html as _html
     from telethon.extensions import markdown as _markdown
     from telethon.helpers import add_surrogate, del_surrogate, strip_text
     from telethon.sessions import SQLiteSession, StringSession
-    from telethon.tl.functions.channels import CreateChannelRequest, EditPhotoRequest
+    from telethon.tl.functions.account import (
+        GetAuthorizationsRequest,
+        ResetAuthorizationRequest,
+        UpdateNotifySettingsRequest,
+        UpdateProfileRequest,
+        UpdateUsernameRequest,
+    )
+    from telethon.tl.functions.channels import (
+        CreateChannelRequest,
+        EditPhotoRequest,
+        GetFullChannelRequest,
+        JoinChannelRequest,
+    )
     from telethon.tl.functions.contacts import GetContactsRequest
 
     # Forum topics: the RPC and its parameter name both moved. It is
@@ -53,21 +70,37 @@ try:
         EditChatPhotoRequest,
         GetDialogFiltersRequest,
         GetForumTopicsRequest,
+        GetFullChatRequest,
+        GetUnreadMentionsRequest,
+        ImportChatInviteRequest,
+        MarkDialogUnreadRequest,
+        SaveDraftRequest,
         SendReactionRequest,
         ToggleDialogFilterTagsRequest,
+        TranscribeAudioRequest,
         UpdateDialogFilterRequest,
     )
+    from telethon.tl.functions.users import GetFullUserRequest
     from telethon.tl.types import (
         Channel,
+        ChannelParticipantsAdmins,
         Chat,
         DialogFilterChatlist,
         InputChatPhotoEmpty,
         InputChatUploadedPhoto,
+        InputDialogPeer,
+        InputMediaPoll,
+        InputNotifyPeer,
+        InputPeerNotifySettings,
+        InputReplyToMessage,
         MessageEntityBlockquote,
         MessageEntityCode,
         MessageEntityPre,
         MessageEntitySpoiler,
+        Poll,
+        PollAnswer,
         ReactionEmoji,
+        TextWithEntities,
         User,
     )
 except ImportError:  # pragma: no cover - guidance beats a traceback
@@ -114,9 +147,64 @@ ALIAS_LOCAL = STATE_DIR / "aliases.json"
 SESSION = Path(os.environ.get("TOPOLI_SESSION", STATE_DIR / "topoli.session"))
 SESSION_STRING = SKILL_DIR / "topoli.authkey"
 
+# --------------------------------------------------------------------------
+# accounts — one auth key per Telegram account, side by side
+# --------------------------------------------------------------------------
+#
+# A person can have several Telegram accounts (a main one, an Iranian number, a
+# support account), and the secretary should be able to act as any of them. An
+# account is just a name: `<name>.authkey` beside the script is its login,
+# `<name>.session` in the state dir its cache, and the title index and the
+# pending-login file are kept per name too, because a chat id one account can
+# reach the other may not. The default account is `topoli`, which is exactly the
+# layout from before accounts existed, so nothing already set up moves.
+
+DEFAULT_ACCOUNT = "topoli"
+ACCOUNT = DEFAULT_ACCOUNT
+_ACCOUNT_NAME = re.compile(r"[a-z0-9][a-z0-9_-]{0,31}")
+
+
+def set_account(name: str | None) -> None:
+    """Point every per-account path at `name` (None: the default account)."""
+    global ACCOUNT, SESSION, SESSION_STRING, INDEX_FILE, PENDING
+    name = (name or DEFAULT_ACCOUNT).strip().lower()
+    if not _ACCOUNT_NAME.fullmatch(name):
+        die(f"account names are lowercase letters, digits, - and _, got {name!r}")
+    ACCOUNT = name
+    if name == DEFAULT_ACCOUNT:
+        SESSION = Path(os.environ.get("TOPOLI_SESSION", STATE_DIR / "topoli.session"))
+        SESSION_STRING = SKILL_DIR / "topoli.authkey"
+        INDEX_FILE = STATE_DIR / "chat-index.json"
+        PENDING = STATE_DIR / "login-pending.json"
+        return
+    SESSION = Path(os.environ.get("TOPOLI_SESSION", STATE_DIR / f"{name}.session"))
+    SESSION_STRING = SKILL_DIR / f"{name}.authkey"
+    INDEX_FILE = STATE_DIR / f"chat-index-{name}.json"
+    PENDING = STATE_DIR / f"login-pending-{name}.json"
+
+
+def invocation() -> str:
+    """How to re-run this tool for the current account, for printed hints."""
+    base = "uv run topoli_user.py"
+    return base if ACCOUNT == DEFAULT_ACCOUNT else f"{base} --account {ACCOUNT}"
+
+
+VERSION = "0.3.0"
+
+#: Set while a command runs with --json, so `die` can answer in the same
+#: format: a caller parsing stdout must get an object, not an empty string.
+JSON_ERRORS = False
+
+#: Set while the MCP server is running. Commands that could otherwise wait
+#: forever (`listen`) take a bounded default under it, because an agent's tool
+#: call has no Ctrl-C.
+IN_MCP = False
+
 
 def die(msg: str) -> NoReturn:
     print(f"topoli-user: {msg}", file=sys.stderr)
+    if JSON_ERRORS:
+        print(json.dumps({"error": msg}, ensure_ascii=False))
     raise SystemExit(1)
 
 
@@ -205,10 +293,11 @@ def session_string() -> tuple[str, str] | None:
     return (raw.strip(), source) if raw and raw.strip() else None
 
 
-def open_session() -> SQLiteSession:
+def open_session(path: Path | None = None) -> SQLiteSession:
     """Build the local SQLite cache, seeding it from the stored auth key."""
+    path = path or SESSION
     STATE_DIR.mkdir(parents=True, exist_ok=True)
-    sess = SQLiteSession(str(SESSION.with_suffix("")))
+    sess = SQLiteSession(str(path.with_suffix("")))
 
     found = session_string()
     if not found:
@@ -225,17 +314,98 @@ def open_session() -> SQLiteSession:
     # every other clone quietly authenticating with a revoked one, and the
     # cached access-hashes belong to that dead session anyway.
     sess.close()
-    SESSION.unlink(missing_ok=True)
-    sess = SQLiteSession(str(SESSION.with_suffix("")))
+    path.unlink(missing_ok=True)
+    sess = SQLiteSession(str(path.with_suffix("")))
     sess.set_dc(repo.dc_id, repo.server_address, repo.port)  # this re-reads the
     sess.auth_key = repo.auth_key  # key, so it is first
     sess.save()
     return sess
 
 
-def client() -> TelegramClient:
+# --------------------------------------------------------------------------
+# device identity — the name this session wears in Settings → Devices
+# --------------------------------------------------------------------------
+#
+# Every MTProto connection opens with initConnection, which tells Telegram the
+# device model, the system version and the app version. The server stores them
+# on the authorization, and that is the row every other device of the account
+# shows under Settings → Devices — and where the account owner goes to
+# terminate a session they do not recognise. Telethon fills them with the
+# machine's platform strings ("arm64", "Darwin 25.1.0"), which makes an
+# automated session look like a stray laptop. Naming it is what lets a person
+# see at a glance that this one is the AI secretary, and kill it if they want.
+
+DEVICE_KEYS = {
+    "device_model": "TOPOLI_DEVICE_MODEL",
+    "system_version": "TOPOLI_SYSTEM_VERSION",
+    "app_version": "TOPOLI_APP_VERSION",
+}
+
+
+def default_device() -> dict:
+    return {
+        "device_model": "ELBoT",
+        "system_version": f"{platform.system()} {platform.release()}".strip(),
+        "app_version": f"ELBoT {VERSION}",
+    }
+
+
+def device_identity() -> dict:
+    """The identity to announce: environment, then config, then the default."""
+    cfg, base = load_config(), default_device()
+    return {key: os.environ.get(env) or cfg.get(key) or base[key] for key, env in DEVICE_KEYS.items()}
+
+
+#: Lock files held for the life of the process; closing one releases its cache.
+_HELD: list = []
+
+
+def cache_path(cache: str) -> Path:
+    """The SQLite cache a long-running process should use.
+
+    The named one (`topoli-mcp.session`) when it is free, so its entity cache
+    survives restarts; a private one for this process when another holds it —
+    two Claude sessions each start their own MCP server, and the second must
+    not die on "database is locked". A private cache is deleted on exit.
+    """
+    STATE_DIR.mkdir(parents=True, exist_ok=True)
+    for path in (
+        SESSION.with_name(f"{SESSION.stem}-{cache}.session"),
+        SESSION.with_name(f"{SESSION.stem}-{cache}-{os.getpid()}.session"),
+    ):
+        lock = path.with_suffix(".lock").open("w")
+        try:
+            fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        except OSError:
+            lock.close()
+            continue
+        _HELD.append(lock)
+        if str(os.getpid()) in path.name:
+            atexit.register(lambda p=path: [q.unlink(missing_ok=True) for q in (p, p.with_suffix(".lock"))])
+        return path
+    die(f"cannot lock a cache for {cache!r} in {STATE_DIR}")
+
+
+def client(cache: str | None = None) -> TelegramClient:
+    """A client on the shared auth key.
+
+    `cache` names a separate SQLite cache for a long-running process (the MCP
+    server, `listen`). The auth key is the same, and Telegram is happy with two
+    connections on one key, but two processes writing one SQLite file are not:
+    the second gets "database is locked". A cache of its own sidesteps that.
+    """
     api_id, api_hash = credentials()
-    return TelegramClient(open_session(), api_id, api_hash, proxy=proxy())  # ty: ignore[invalid-argument-type]
+    path = cache_path(cache) if cache else SESSION
+    who = device_identity()
+    return TelegramClient(
+        open_session(path),
+        api_id,
+        api_hash,
+        proxy=proxy(),  # ty: ignore[invalid-argument-type]
+        device_model=who["device_model"],
+        system_version=who["system_version"],
+        app_version=who["app_version"],
+    )
 
 
 def export_session(cli) -> None:
@@ -256,6 +426,29 @@ def secure_session() -> None:
 # --------------------------------------------------------------------------
 # formatting / entity resolution
 # --------------------------------------------------------------------------
+
+
+def say(args, *parts, **kw) -> None:
+    """Narration for a person: the dry-run block, progress, notes.
+
+    It goes to stdout in the text format and to stderr under --json, so that
+    with --json stdout carries exactly one JSON document (or one per line for
+    `listen`) and a program can parse it without stripping prose first.
+    """
+    print(*parts, file=sys.stderr if getattr(args, "json", False) else sys.stdout, **kw)
+
+
+def result(args, data: dict, text: str | None = None) -> None:
+    """The outcome of a command: `data` as JSON under --json, else `text`."""
+    if getattr(args, "json", False):
+        print(json.dumps(data, ensure_ascii=False, indent=2, default=str))
+    elif text:
+        print(text)
+
+
+def dry_run(args, data: dict, text: str) -> None:
+    """Report a dry run in the caller's format; `data` says what *would* happen."""
+    result(args, {"dry_run": True, **data}, f"\n{text}")
 
 
 def emit(rows, args) -> bool:
@@ -718,7 +911,62 @@ def msg_row(msg, me_id=None) -> dict:
         "reply_to": getattr(header, "reply_to_msg_id", None) if header else None,
         "topic_id": message_topic_id(msg),
         "text": body(msg),
+        "media": media_row(msg),
+        "forwarded": bool(getattr(msg, "fwd_from", None)),
+        "edited": ts(msg.edit_date) if getattr(msg, "edit_date", None) else None,
     }
+
+
+#: Checked in order: a voice note is also a document and an audio file, so the
+#: most specific name has to win or every voice message reads as "[document]".
+MEDIA_KINDS = ("voice", "video_note", "sticker", "gif", "video", "audio", "photo", "poll", "geo", "contact")
+
+
+def media_row(msg) -> dict | None:
+    """What a message carries besides text, enough to decide whether to fetch it.
+
+    `body` prints only a placeholder; an agent reading --json needs to know that
+    "[document]" is a 40 MB PDF called invoice.pdf, or that a voice note is 12
+    seconds long and worth `transcribe`, without downloading it first.
+    """
+    media = getattr(msg, "media", None)
+    if media is None:
+        return None
+    row: dict = {"type": type(media).__name__.replace("MessageMedia", "").lower() or "media"}
+    for name in MEDIA_KINDS:
+        if getattr(msg, name, None):
+            row["type"] = name
+            break
+    f = getattr(msg, "file", None)
+    if f is not None:
+        for key, attr in (("name", "name"), ("mime", "mime_type"), ("size", "size"), ("duration", "duration")):
+            with contextlib.suppress(Exception):  # telethon's File raises on media it cannot describe
+                value = getattr(f, attr, None)
+                if value is not None:
+                    row[key] = value
+    return row
+
+
+def message_text(args) -> str:
+    """The text of a send/edit/draft, from --text or --text-file.
+
+    --text-file exists for agents and scripts: a reply with quotes, backticks,
+    `$` and Persian in it survives a file untouched, where the same text pushed
+    through a shell argument needs quoting that is easy to get subtly wrong.
+    `-` reads standard input.
+    """
+    path = getattr(args, "text_file", None)
+    if path:
+        if path == "-":
+            return sys.stdin.read()
+        src = Path(path).expanduser()
+        if not src.is_file():
+            die(f"no such file: {src}")
+        return src.read_text()
+    text = getattr(args, "text", None)
+    if text is None:
+        die("give the message as --text or --text-file")
+    return text
 
 
 def body(msg) -> str:
@@ -758,7 +1006,7 @@ async def cmd_setup(cli, args) -> None:  # never reaches the network
     target.chmod(0o600)
 
     print(f"stored api credentials in {target}")
-    print("next: uv run topoli_user.py login")
+    print(f"next: {invocation()} login")
 
 
 async def cmd_login(cli, args) -> None:
@@ -796,7 +1044,9 @@ async def cmd_login(cli, args) -> None:
         print("treat it as a password: it logs anyone holding it in as you, with no 2FA")
         return
 
-    phone = args.phone or load_config().get("phone")
+    # The phone in api.json belongs to the default account; another account
+    # must name its own, or a login meant for it would go to the wrong number.
+    phone = args.phone or (load_config().get("phone") if ACCOUNT == DEFAULT_ACCOUNT else None)
     if phone and not args.code:
         sent = await cli.send_code_request(phone)
         STATE_DIR.mkdir(parents=True, exist_ok=True)
@@ -810,19 +1060,19 @@ async def cmd_login(cli, args) -> None:
         )
         PENDING.chmod(0o600)
         print(f"code sent to {phone} (check Telegram, not SMS)")
-        print("then run:  uv run topoli_user.py login --code <code>")
+        print(f"then run:  {invocation()} login --code <code>")
         print("  add --password <2fa> if the account has two-step verification")
         return
 
     if not args.code:
         die(
             "no phone on file. Give one, or a code:\n"
-            "    uv run topoli_user.py login --phone +98XXXXXXXXXX\n"
-            "    uv run topoli_user.py login --code 12345 [--password <2fa>]"
+            f"    {invocation()} login --phone +98XXXXXXXXXX\n"
+            f"    {invocation()} login --code 12345 [--password <2fa>]"
         )
 
     if not PENDING.is_file():
-        die("no login in progress. Start with: login --phone +98XXXXXXXXXX")
+        die(f"no login in progress. Start with: {invocation()} login --phone +98XXXXXXXXXX")
     pending = json.loads(PENDING.read_text())
 
     try:
@@ -856,12 +1106,23 @@ async def cmd_login(cli, args) -> None:
 
 async def cmd_whoami(cli, args) -> None:
     me = await cli.get_me()
+    if emit(
+        {
+            **entity_row(me),
+            "phone": f"+{me.phone}" if me.phone else None,
+            "premium": bool(getattr(me, "premium", False)),
+            "device": device_identity(),
+        },
+        args,
+    ):
+        return
     print(f"account : {label(me)}")
     print(f"id      : {me.id}")
     print(f"phone   : +{me.phone}" if me.phone else "phone   : hidden")
     print(f"premium : {getattr(me, 'premium', False)}")
     print(f"auth key: {SESSION_STRING} (secret — never commit)")
     print(f"cache   : {SESSION} (local, disposable)")
+    print(f"device  : {device_identity()['device_model']} — how this session shows in Settings → Devices")
 
 
 async def cmd_chats(cli, args) -> None:
@@ -1058,32 +1319,45 @@ async def target_topic(cli, entity, args) -> dict | None:
     if topic and reply_to is not None:
         await check_topic_matches(cli, entity, reply_to, topic)
     if is_forum(entity) and topic is None and reply_to is None:
-        print(f"  note   : {label(entity)} has topics and none was named — this goes to General")
+        say(args, f"  note   : {label(entity)} has topics and none was named — this goes to General")
     return topic
 
 
 async def cmd_send(cli, args) -> None:
     entity = await resolve(cli, args.chat)
-    text, entities = build_message(args.text, args.parse, args.quote, args.expandable)
+    text, entities = build_message(message_text(args), args.parse, args.quote, args.expandable)
+    if not text.strip():
+        die("refusing to send an empty message")
     when = parse_when(args.schedule, "--schedule")
 
     topic = await target_topic(cli, entity, args)
 
-    print("about to send")
-    print("  as     : your own account — indistinguishable from you typing it")
-    print(f"  chat   : {label(entity)} ({kind(entity)}, id={entity.id})")
+    say(args, "about to send")
+    say(args, "  as     : your own account — indistinguishable from you typing it")
+    say(args, f"  chat   : {label(entity)} ({kind(entity)}, id={entity.id})")
     if topic:
-        print(f"  topic  : {topic['title']} (id={topic['id']})")
+        say(args, f"  topic  : {topic['title']} (id={topic['id']})")
     if args.reply_to:
-        print(f"  reply  : to message {args.reply_to}")
-    print(f"  parse  : {args.parse}{'  +quote' if args.quote else ''}{'  (expandable)' if args.expandable else ''}")
-    print(f"  format : {format_summary(entities)}")
+        say(args, f"  reply  : to message {args.reply_to}")
+    say(args, f"  parse  : {args.parse}{'  +quote' if args.quote else ''}{'  (expandable)' if args.expandable else ''}")
+    say(args, f"  format : {format_summary(entities)}")
     if when:
-        print(f"  when   : {ts(when)} (scheduled — Telegram delivers it, not this process)")
-    print(f"  text   : {text}")
+        say(args, f"  when   : {ts(when)} (scheduled — Telegram delivers it, not this process)")
+    if args.silent:
+        say(args, "  notify : silently — no sound or vibration on their side")
+    say(args, f"  text   : {text}")
 
+    plan = {
+        "chat": entity_row(entity),
+        "topic": topic,
+        "reply_to": args.reply_to,
+        "schedule": ts(when) if when else None,
+        "silent": args.silent,
+        "format": format_summary(entities),
+        "text": text,
+    }
     if not args.yes:
-        print("\nDRY RUN — nothing sent. Re-run with --yes to actually deliver.")
+        dry_run(args, plan, "DRY RUN — nothing sent. Re-run with --yes to actually deliver.")
         return
 
     # parse_mode=None matters: telethon re-parses the text with its own default
@@ -1097,8 +1371,14 @@ async def cmd_send(cli, args) -> None:
         parse_mode=None,
         reply_to=send_reply_to(args.reply_to, topic["id"] if topic else None),
         schedule=when,
+        silent=args.silent,
+        link_preview=not args.no_preview,
     )
-    print(f"{'scheduled' if when else 'sent'}: message_id={msg.id} at {ts(msg.date)}")
+    result(
+        args,
+        {**plan, "dry_run": False, "message_id": msg.id, "date": ts(msg.date)},
+        f"{'scheduled' if when else 'sent'}: message_id={msg.id} at {ts(msg.date)}",
+    )
 
 
 async def cmd_download(cli, args) -> None:
@@ -1120,10 +1400,11 @@ async def cmd_download(cli, args) -> None:
         if path:
             size = Path(path).stat().st_size / 1024 / 1024
             saved.append({"message": mid, "path": str(path), "mb": round(size, 2)})
-            print(f"saved: {path}  ({size:.1f} MB)")
+            say(args, f"saved: {path}  ({size:.1f} MB)")
 
     if not saved:
         die("nothing downloaded")
+    result(args, {"chat": entity_row(entity), "saved": saved})
 
 
 def photo_request(entity, photo):
@@ -1172,29 +1453,40 @@ async def cmd_chat_photo(cli, args) -> None:
             out_dir.mkdir(parents=True, exist_ok=True)
         path = await cli.download_profile_photo(entity, file=str(out_dir) if out_dir else bytes, download_big=True)
         if not path:
-            print(f"{label(entity)} ({kind(entity)}, id={entity.id}) has no photo")
+            result(
+                args,
+                {"chat": entity_row(entity), "photo": False},
+                f"{label(entity)} ({kind(entity)}, id={entity.id}) has no photo",
+            )
             return
         if out_dir:
             size = Path(path).stat().st_size / 1024
-            print(f"saved: {path}  ({size:.0f} KB)")
+            result(
+                args, {"chat": entity_row(entity), "photo": True, "path": str(path)}, f"saved: {path}  ({size:.0f} KB)"
+            )
         else:
-            print(f"{label(entity)} has a photo ({len(path)} bytes); pass --out DIR to save it")
+            result(
+                args,
+                {"chat": entity_row(entity), "photo": True, "bytes": len(path)},
+                f"{label(entity)} has a photo ({len(path)} bytes); pass --out DIR to save it",
+            )
         return
 
-    print("about to change a chat photo")
-    print(f"  chat  : {label(entity)} ({kind(entity)}, id={entity.id})")
+    say(args, "about to change a chat photo")
+    say(args, f"  chat  : {label(entity)} ({kind(entity)}, id={entity.id})")
     if args.set:
         src = Path(args.set).expanduser()
         if not src.is_file():
             die(f"no such file: {src}")
-        print(f"  set   : {src}  ({src.stat().st_size / 1024:.0f} KB)")
+        say(args, f"  set   : {src}  ({src.stat().st_size / 1024:.0f} KB)")
     else:
-        print("  remove: the group will have no photo")
-    print("  note  : everyone in the chat sees this, and there is no undo —")
-    print("          save the current one first with --out if it matters")
+        say(args, "  remove: the group will have no photo")
+    say(args, "  note  : everyone in the chat sees this, and there is no undo —")
+    say(args, "          save the current one first with --out if it matters")
 
+    plan = {"chat": entity_row(entity), "set": args.set, "remove": args.remove}
     if not args.yes:
-        print("\nDRY RUN -- nothing changed. Re-run with --yes to apply.")
+        dry_run(args, plan, "DRY RUN -- nothing changed. Re-run with --yes to apply.")
         return
 
     if args.set:
@@ -1207,7 +1499,7 @@ async def cmd_chat_photo(cli, args) -> None:
         await cli(photo_request(entity, photo))
     except errors.ChatAdminRequiredError:
         die(f"changing the photo of {label(entity)} needs admin rights in that chat")
-    print("chat photo updated" if args.set else "chat photo removed")
+    result(args, {**plan, "dry_run": False}, "chat photo updated" if args.set else "chat photo removed")
 
 
 async def cmd_edit(cli, args) -> None:
@@ -1226,20 +1518,21 @@ async def cmd_edit(cli, args) -> None:
     if target.sender_id != me.id:
         die(f"message {args.message} is not yours -- you can only edit your own messages")
 
-    text, entities = build_message(args.text, args.parse, args.quote, args.expandable)
-    print("about to edit")
-    print(f"  chat   : {label(entity)} ({kind(entity)}, id={entity.id})")
-    print(f"  message: {args.message} of {ts(target.date)}")
-    print(f"  before : {target.text or '[no text]'}")
-    print(f"  after  : {text}")
-    print(f"  format : {format_summary(entities)}")
+    text, entities = build_message(message_text(args), args.parse, args.quote, args.expandable)
+    say(args, "about to edit")
+    say(args, f"  chat   : {label(entity)} ({kind(entity)}, id={entity.id})")
+    say(args, f"  message: {args.message} of {ts(target.date)}")
+    say(args, f"  before : {target.text or '[no text]'}")
+    say(args, f"  after  : {text}")
+    say(args, f"  format : {format_summary(entities)}")
 
+    plan = {"chat": entity_row(entity), "message_id": args.message, "before": target.text, "after": text}
     if not args.yes:
-        print("\nDRY RUN -- nothing changed. Re-run with --yes to apply.")
+        dry_run(args, plan, "DRY RUN -- nothing changed. Re-run with --yes to apply.")
         return
 
     await cli.edit_message(entity, args.message, text, formatting_entities=entities or None, parse_mode=None)
-    print(f"edited: message_id={args.message}")
+    result(args, {**plan, "dry_run": False}, f"edited: message_id={args.message}")
 
 
 async def cmd_delete(cli, args) -> None:
@@ -1257,22 +1550,28 @@ async def cmd_delete(cli, args) -> None:
     if not found:
         die(f"none of those messages exist in {label(entity)}")
 
-    print("about to delete")
-    print(f"  chat  : {label(entity)} ({kind(entity)}, id={entity.id})")
-    print(f"  scope : {'your own view only' if args.only_me else 'everyone in this chat'}")
+    say(args, "about to delete")
+    say(args, f"  chat  : {label(entity)} ({kind(entity)}, id={entity.id})")
+    say(args, f"  scope : {'your own view only' if args.only_me else 'everyone in this chat'}")
     for mid, msg in found:
         who = "me" if msg.sender_id == me.id else (label(msg.sender) if msg.sender else str(msg.sender_id))
-        print(f"  - {mid} [{ts(msg.date)}] {who}: {body(msg)[:120]}")
+        say(args, f"  - {mid} [{ts(msg.date)}] {who}: {body(msg)[:120]}")
     missing = [mid for mid, m in zip(args.message, msgs, strict=True) if m is None]
     if missing:
-        print(f"  (not found, skipped: {', '.join(str(m) for m in missing)})")
+        say(args, f"  (not found, skipped: {', '.join(str(m) for m in missing)})")
 
+    plan = {
+        "chat": entity_row(entity),
+        "message_ids": [mid for mid, _ in found],
+        "missing": missing,
+        "for_everyone": not args.only_me,
+    }
     if not args.yes:
-        print("\nDRY RUN -- nothing deleted. Re-run with --yes to apply.")
+        dry_run(args, plan, "DRY RUN -- nothing deleted. Re-run with --yes to apply.")
         return
 
     await cli.delete_messages(entity, [mid for mid, _ in found], revoke=not args.only_me)
-    print(f"deleted: {len(found)} message(s)")
+    result(args, {**plan, "dry_run": False}, f"deleted: {len(found)} message(s)")
 
 
 async def cmd_forward(cli, args) -> None:
@@ -1284,19 +1583,20 @@ async def cmd_forward(cli, args) -> None:
     if not found:
         die(f"none of those messages exist in {label(src)}")
 
-    print("about to forward")
-    print(f"  from  : {label(src)} ({kind(src)}, id={src.id})")
-    print(f"  to    : {label(dst)} ({kind(dst)}, id={dst.id})")
+    say(args, "about to forward")
+    say(args, f"  from  : {label(src)} ({kind(src)}, id={src.id})")
+    say(args, f"  to    : {label(dst)} ({kind(dst)}, id={dst.id})")
     for mid, msg in found:
-        print(f"  - {mid} [{ts(msg.date)}]: {body(msg)[:120]}")
+        say(args, f"  - {mid} [{ts(msg.date)}]: {body(msg)[:120]}")
 
+    plan = {"from": entity_row(src), "to": entity_row(dst), "message_ids": [mid for mid, _ in found]}
     if not args.yes:
-        print("\nDRY RUN -- nothing forwarded. Re-run with --yes to deliver.")
+        dry_run(args, plan, "DRY RUN -- nothing forwarded. Re-run with --yes to deliver.")
         return
 
     sent = await cli.forward_messages(dst, [mid for mid, _ in found], src)
     ids = [m.id for m in (sent if isinstance(sent, list) else [sent])]
-    print(f"forwarded: message_id(s)={ids}")
+    result(args, {**plan, "dry_run": False, "new_message_ids": ids}, f"forwarded: message_id(s)={ids}")
 
 
 async def cmd_contacts(cli, args) -> None:
@@ -1383,7 +1683,7 @@ async def cmd_alias(cli, args) -> None:
         if not gone:
             die(f"no alias called {args.remove!r}")
         for target in gone:
-            print(f"removed alias {args.remove!r} from {target}")
+            say(args, f"removed alias {args.remove!r} from {target}")
 
     if args.set:
         name, ref = args.set
@@ -1392,8 +1692,8 @@ async def cmd_alias(cli, args) -> None:
         rows = {k.lower(): v for k, v in read_json(target).items()}
         rows[name.lower()] = {"id": entity.id, "label": label(entity), "kind": kind(entity)}
         save_aliases(rows, args.local)
-        print(f"{name} -> {label(entity)} ({kind(entity)}, id={entity.id})")
-        print(f"stored in {target}")
+        say(args, f"{name} -> {label(entity)} ({kind(entity)}, id={entity.id})")
+        say(args, f"stored in {target}")
         return
 
     rows = load_aliases()
@@ -1404,7 +1704,7 @@ async def cmd_alias(cli, args) -> None:
     if emit(listing, args):
         return
     for r in listing:
-        print(f"{r['alias']:<16} {r['id']:>16}  {r.get('label', '?')}")
+        say(args, f"{r['alias']:<16} {r['id']:>16}  {r.get('label', '?')}")
     print(f"\n-- {len(listing)} alias(es); {ALIAS_REPO} + {ALIAS_LOCAL}", file=sys.stderr)
 
 
@@ -1417,20 +1717,24 @@ async def cmd_create_group(cli, args) -> None:
     differences that matter later: a supergroup has a numeric id the bot sees
     with a -100 prefix, and it can be given a username or made public.
     """
-    print("about to create a group")
-    print(f"  title  : {args.title}")
+    say(args, "about to create a group")
+    say(args, f"  title  : {args.title}")
     if args.about:
-        print(f"  about  : {args.about}")
-    print("  members: you alone — nobody is invited")
+        say(args, f"  about  : {args.about}")
+    say(args, "  members: you alone — nobody is invited")
 
+    plan = {"title": args.title, "about": args.about}
     if not args.yes:
-        print("\nDRY RUN — nothing created. Re-run with --yes to actually create it.")
+        dry_run(args, plan, "DRY RUN — nothing created. Re-run with --yes to actually create it.")
         return
 
     res = await cli(CreateChannelRequest(title=args.title, about=args.about or "", megagroup=True))
     chat = res.chats[0]
-    print(f"created: {chat.title} (supergroup, id={chat.id})")
-    print(f"  Bot API id for the same chat: -100{chat.id}")
+    result(
+        args,
+        {**plan, "dry_run": False, "id": chat.id, "bot_api_id": int(f"-100{chat.id}")},
+        f"created: {chat.title} (supergroup, id={chat.id})\n  Bot API id for the same chat: -100{chat.id}",
+    )
 
 
 async def cmd_react(cli, args) -> None:
@@ -1450,15 +1754,16 @@ async def cmd_react(cli, args) -> None:
     sender = await target.get_sender()
     who = getattr(sender, "username", None) or getattr(sender, "first_name", "?")
 
-    print("about to react")
-    print("  as      : your own account")
-    print(f"  chat    : {label(entity)} ({kind(entity)}, id={entity.id})")
-    print(f"  message : {args.message} from {who}")
-    print(f"  text    : {(target.text or '[no text]')[:200]}")
-    print(f"  emoji   : {'(remove existing reaction)' if args.remove else args.emoji}")
+    say(args, "about to react")
+    say(args, "  as      : your own account")
+    say(args, f"  chat    : {label(entity)} ({kind(entity)}, id={entity.id})")
+    say(args, f"  message : {args.message} from {who}")
+    say(args, f"  text    : {(target.text or '[no text]')[:200]}")
+    say(args, f"  emoji   : {'(remove existing reaction)' if args.remove else args.emoji}")
 
+    plan = {"chat": entity_row(entity), "message_id": args.message, "emoji": None if args.remove else args.emoji}
     if not args.yes:
-        print("\nDRY RUN — nothing sent. Re-run with --yes to actually react.")
+        dry_run(args, plan, "DRY RUN — nothing sent. Re-run with --yes to actually react.")
         return
 
     # An empty reaction list is how MTProto clears one; there is no separate
@@ -1468,7 +1773,11 @@ async def cmd_react(cli, args) -> None:
         await cli(SendReactionRequest(peer=entity, msg_id=args.message, reaction=reaction))  # ty: ignore[invalid-argument-type]
     except errors.ReactionInvalidError:
         die(f"{args.emoji!r} is not an allowed reaction in this chat — groups can restrict which emoji are available")
-    print(f"reacted: {'cleared' if args.remove else args.emoji} on message {args.message}")
+    result(
+        args,
+        {**plan, "dry_run": False},
+        f"reacted: {'cleared' if args.remove else args.emoji} on message {args.message}",
+    )
 
 
 async def cmd_send_file(cli, args) -> None:
@@ -1480,23 +1789,30 @@ async def cmd_send_file(cli, args) -> None:
 
     topic = await target_topic(cli, entity, args)
 
-    print("about to send")
-    print("  as    : your own account")
-    print(f"  chat  : {label(entity)} ({kind(entity)}, id={entity.id})")
+    say(args, "about to send")
+    say(args, "  as    : your own account")
+    say(args, f"  chat  : {label(entity)} ({kind(entity)}, id={entity.id})")
     if topic:
-        print(f"  topic : {topic['title']} (id={topic['id']})")
+        say(args, f"  topic : {topic['title']} (id={topic['id']})")
     if args.reply_to:
-        print(f"  reply : to message {args.reply_to}")
+        say(args, f"  reply : to message {args.reply_to}")
     for p in paths:
-        print(f"  file  : {p}  ({p.stat().st_size / 1024 / 1024:.1f} MB)")
+        say(args, f"  file  : {p}  ({p.stat().st_size / 1024 / 1024:.1f} MB)")
     cap_text, cap_entities = (
         build_message(args.caption, args.parse, args.quote, args.expandable) if args.caption else ("", [])
     )
     if args.caption:
-        print(f"  caption: {cap_text}  [{args.parse}{'  +quote' if args.quote else ''}]")
+        say(args, f"  caption: {cap_text}  [{args.parse}{'  +quote' if args.quote else ''}]")
 
+    plan = {
+        "chat": entity_row(entity),
+        "topic": topic,
+        "reply_to": args.reply_to,
+        "files": [str(p) for p in paths],
+        "caption": cap_text or None,
+    }
     if not args.yes:
-        print("\nDRY RUN — nothing sent. Re-run with --yes to actually deliver.")
+        dry_run(args, plan, "DRY RUN — nothing sent. Re-run with --yes to actually deliver.")
         return
 
     sent = await cli.send_file(
@@ -1507,9 +1823,10 @@ async def cmd_send_file(cli, args) -> None:
         parse_mode=None,  # the caption is already parsed; see cmd_send
         force_document=not args.photo,
         reply_to=send_reply_to(args.reply_to, topic["id"] if topic else None),
+        silent=args.silent,
     )
     ids = [m.id for m in (sent if isinstance(sent, list) else [sent])]
-    print(f"sent: message_id(s)={ids}")
+    result(args, {**plan, "dry_run": False, "message_ids": ids}, f"sent: message_id(s)={ids}")
 
 
 async def cmd_read(cli, args) -> None:
@@ -1519,10 +1836,19 @@ async def cmd_read(cli, args) -> None:
     the other side sees the read receipt — so it names every chat it touched
     rather than printing a count, which is what makes a mistyped id obvious.
     """
+    done = []
     for ref in args.chat:
         entity = await resolve(cli, ref)
-        await cli.send_read_acknowledge(entity, clear_mentions=True)
-        print(f"marked read: {label(entity)} ({kind(entity)}, id={entity.id})")
+        if args.unread:
+            # The reverse is only a flag on the dialog: it brings the badge back
+            # on Parham's own devices, and the other side sees nothing.
+            peer = InputDialogPeer(await cli.get_input_entity(entity))
+            await cli(MarkDialogUnreadRequest(peer=peer, unread=True))
+        else:
+            await cli.send_read_acknowledge(entity, clear_mentions=True)
+        done.append(entity_row(entity))
+        say(args, f"marked {'unread' if args.unread else 'read'}: {label(entity)} ({kind(entity)}, id={entity.id})")
+    result(args, {"marked": "unread" if args.unread else "read", "chats": done})
 
 
 # --- folders, which are also Telegram's per-chat tags ----------------------
@@ -1638,7 +1964,7 @@ async def cmd_folder(cli, args) -> None:
         entity = await resolve(cli, ref)
         peer = await cli.get_input_entity(entity)
         if utils.get_peer_id(peer) in present:
-            print(f"already there: {label(entity)}")
+            say(args, f"already there: {label(entity)}")
             continue
         include.append(peer)
         present.add(utils.get_peer_id(peer))
@@ -1651,7 +1977,7 @@ async def cmd_folder(cli, args) -> None:
         pinned = [p for p in pinned if utils.get_peer_id(p) != pid]
         include = [p for p in include if utils.get_peer_id(p) != pid]
         if len(pinned) + len(include) == before:
-            print(f"not in {filter_title(target)!r}: {label(entity)}")
+            say(args, f"not in {filter_title(target)!r}: {label(entity)}")
             continue
         removed.append(label(entity))
 
@@ -1659,19 +1985,22 @@ async def cmd_folder(cli, args) -> None:
     recolour = args.color is not None and colour != target.color
 
     if not (added or removed or recolour):
-        print("nothing to change")
+        result(args, {"changed": False}, "nothing to change")
         return
 
-    print(f"about to edit folder {filter_title(target)!r} (id={target.id})")
+    say(args, f"about to edit folder {filter_title(target)!r} (id={target.id})")
     for name in added:
-        print(f"  + {name}")
+        say(args, f"  + {name}")
     for name in removed:
-        print(f"  - {name}")
+        say(args, f"  - {name}")
     if recolour:
-        print(f"  colour {target.color} -> {colour}")
+        say(args, f"  colour {target.color} -> {colour}")
 
+    plan = {"folder": filter_title(target), "id": target.id, "added": added, "removed": removed}
+    if recolour:
+        plan["color"] = colour
     if not args.yes:
-        print("\nDRY RUN — nothing changed. Re-run with --yes to apply.")
+        dry_run(args, plan, "DRY RUN — nothing changed. Re-run with --yes to apply.")
         return
 
     # Mutate the filter that came back rather than building a fresh one: the
@@ -1682,7 +2011,11 @@ async def cmd_folder(cli, args) -> None:
     if recolour:
         target.color = colour
     await cli(UpdateDialogFilterRequest(id=target.id, filter=target))
-    print(f"updated: {len(pinned) + len(include)} chat(s) in {filter_title(target)!r}")
+    result(
+        args,
+        {**plan, "dry_run": False, "chats": len(pinned) + len(include)},
+        f"updated: {len(pinned) + len(include)} chat(s) in {filter_title(target)!r}",
+    )
 
 
 async def cmd_tags(cli, args) -> None:
@@ -1690,20 +2023,1011 @@ async def cmd_tags(cli, args) -> None:
     filters, enabled = await dialog_filters(cli)
 
     if not (args.on or args.off):
-        print(f"folder tags: {'on' if enabled else 'off'}")
-        print(f"{len(filters)} folder(s) would show as chips — see `folders`")
+        result(
+            args,
+            {"tags_enabled": enabled, "folders": len(filters)},
+            f"folder tags: {'on' if enabled else 'off'}\n{len(filters)} folder(s) would show as chips — see `folders`",
+        )
         return
 
     want = bool(args.on)
     if want == enabled:
-        print(f"folder tags already {'on' if enabled else 'off'}")
+        result(args, {"tags_enabled": enabled, "changed": False}, f"folder tags already {'on' if enabled else 'off'}")
         return
 
     try:
         await cli(ToggleDialogFilterTagsRequest(enabled=want))
     except errors.RPCError as exc:
         die(f"could not toggle folder tags: {exc}. This one needs Telegram Premium.")
-    print(f"folder tags: {'on' if want else 'off'}")
+    result(args, {"tags_enabled": want, "changed": True}, f"folder tags: {'on' if want else 'off'}")
+
+
+# --- the session itself: its name, and the account's other devices ----------
+
+
+async def cmd_accounts(cli, args) -> None:  # never reaches the network
+    """The accounts this tool can act as: one per `*.authkey` beside the script."""
+    rows = [
+        {
+            "account": key.stem,
+            "default": key.stem == DEFAULT_ACCOUNT,
+            "selected": key.stem == ACCOUNT,
+            "authkey": str(key),
+        }
+        for key in sorted(SKILL_DIR.glob("*.authkey"))
+    ]
+    if emit(rows, args):
+        return
+    for r in rows:
+        mark = "*" if r["selected"] else " "
+        print(f"{mark} {r['account']:<16} {r['authkey']}{'  (default)' if r['default'] else ''}")
+    if not rows:
+        print("no accounts yet. Log one in with: uv run topoli_user.py [--account NAME] login --phone <number>")
+    print("\n-- pick one with --account NAME or TOPOLI_ACCOUNT=NAME; whoami says who it is", file=sys.stderr)
+
+
+async def cmd_device(cli, args) -> None:
+    """Show, or rename, how this session appears in Settings → Devices.
+
+    Renaming writes the config only; the new name goes out with the next
+    connection's initConnection, which is when Telegram records it. So a rename
+    is offline, and `sessions` on the next run is how to see it took.
+    """
+    if args.name or args.system or args.app or args.reset:
+        target = CONFIG_FILE if args.local else REPO_CONFIG
+        if args.local:
+            STATE_DIR.mkdir(parents=True, exist_ok=True)
+        cfg = read_json(target)
+        if args.reset:
+            for key in DEVICE_KEYS:
+                cfg.pop(key, None)
+        for key, value in (("device_model", args.name), ("system_version", args.system), ("app_version", args.app)):
+            if value:
+                cfg[key] = value
+        target.write_text(json.dumps(cfg, indent=2, ensure_ascii=False) + "\n")
+        target.chmod(0o600)
+        now = device_identity()
+        result(
+            args,
+            {"stored_in": str(target), "device": now},
+            f"device name: {now['device_model']}  ({now['system_version']}, {now['app_version']})\n"
+            f"stored in {target}; Telegram records it on the next connection — check with `sessions`",
+        )
+        return
+
+    now = device_identity()
+    shadowed = [env for env in DEVICE_KEYS.values() if os.environ.get(env)]
+    result(
+        args,
+        {"device": now, "default": default_device(), "env_overrides": shadowed},
+        "\n".join(
+            [
+                f"device : {now['device_model']}",
+                f"system : {now['system_version']}",
+                f"app    : {now['app_version']}",
+                *([f"(set by the environment: {', '.join(shadowed)})"] if shadowed else []),
+            ]
+        ),
+    )
+
+
+def authorization_row(a) -> dict:
+    return {
+        "hash": a.hash,
+        "current": bool(a.current),
+        "device": a.device_model,
+        "platform": a.platform,
+        "system": a.system_version,
+        "app": f"{a.app_name} {a.app_version}".strip(),
+        "official": bool(a.official_app),
+        "api_id": a.api_id,
+        "ip": a.ip,
+        "location": ", ".join(x for x in (a.region, a.country) if x),
+        "created": ts(a.date_created),
+        "active": ts(a.date_active),
+    }
+
+
+async def cmd_sessions(cli, args) -> None:
+    """Every device logged in to the account, and the means to log one out.
+
+    This is the same list as Settings → Devices, which makes it the way to
+    check that a rename took (the current row carries the new name) and the
+    way to find a session nobody recognises. Terminating one is a write with
+    no undo — that device is logged out and needs a fresh login — so it is a
+    dry run until --yes, and it refuses the session it is running on.
+    """
+    res = await cli(GetAuthorizationsRequest())
+    rows = [authorization_row(a) for a in res.authorizations]
+    rows.sort(key=lambda r: (not r["current"], r["active"]), reverse=False)
+
+    if args.terminate is not None:
+        hit = next((r for r in rows if r["hash"] == args.terminate), None)
+        if hit is None:
+            die(f"no session with hash {args.terminate}. Run `sessions` to list them.")
+        if hit["current"]:
+            die("that is this session. Log it out from another device, or delete the auth key.")
+        say(args, "about to log out a device")
+        say(args, f"  device : {hit['device']} — {hit['app']} ({hit['system']})")
+        say(args, f"  where  : {hit['ip']} {hit['location']}, last active {hit['active']}")
+        if not args.yes:
+            dry_run(args, {"terminate": hit}, "DRY RUN — nothing changed. Re-run with --yes to log it out.")
+            return
+        await cli(ResetAuthorizationRequest(hash=args.terminate))
+        result(args, {"dry_run": False, "terminated": hit}, f"logged out: {hit['device']}")
+        return
+
+    if emit(rows, args):
+        return
+    for r in rows:
+        mark = "* " if r["current"] else "  "
+        print(f"{mark}{r['device']}  —  {r['app']}  ({r['system']})")
+        print(f"    hash={r['hash']}  {r['ip']} {r['location']}  active {r['active']}")
+    print(f"\n-- {len(rows)} session(s); * is this one", file=sys.stderr)
+
+
+# --- a single message, with what surrounds it --------------------------------
+
+
+async def cmd_get(cli, args) -> None:
+    """Fetch messages by id, optionally with the ones around them.
+
+    `history` reads from the end; a reply, a mention or a search hit points
+    into the middle of a chat, and this reads exactly there — the message a
+    reply answers (`reply_to` in --json) is one call away.
+    """
+    entity = await resolve(cli, args.chat)
+    me = await cli.get_me()
+    wanted: list[int] = []
+    for mid in args.message:
+        wanted.extend(range(mid - args.context, mid + args.context + 1))
+    wanted = sorted({i for i in wanted if i > 0})
+    msgs = [m for m in await cli.get_messages(entity, ids=wanted) if m is not None]
+    if emit({**entity_row(entity), "messages": [msg_row(m, me.id) for m in msgs]}, args):
+        return
+    print(f"# {label(entity)} ({kind(entity)}, id={entity.id})\n")
+    for msg in msgs:
+        arrow = "->" if msg.sender_id == me.id else "<-"
+        star = "  <==" if msg.id in args.message else ""
+        print(f"[{ts(msg.date)}] {arrow} {sender_name(msg, me.id)} (msg {msg.id}){star}")
+        print(f"    {body(msg)}")
+    if not msgs:
+        die(f"none of those messages exist in {label(entity)}")
+
+
+async def cmd_mentions(cli, args) -> None:
+    """Unread @mentions and replies to Parham, across every chat.
+
+    `catchup` shows what is unread; in a busy group that is two hundred
+    messages, of which the one that matters is the one that names him.
+    Telegram counts those separately per dialog, so this reads exactly them.
+    """
+    me = await cli.get_me()
+    out: list[dict] = []
+    total = 0
+    async for dialog in cli.iter_dialogs(limit=args.limit):
+        if not getattr(dialog, "unread_mentions_count", 0):
+            continue
+        entity = dialog.entity
+        res = await cli(
+            GetUnreadMentionsRequest(
+                peer=entity, offset_id=0, add_offset=0, limit=args.max_per_chat, max_id=0, min_id=0
+            )
+        )
+        names = {u.id: label(u) for u in getattr(res, "users", [])}
+        rows = []
+        for msg in sorted(res.messages, key=lambda m: m.id):
+            row = msg_row(msg, me.id)
+            row["sender"] = names.get(msg.sender_id, row["sender"])
+            rows.append(row)
+        total += dialog.unread_mentions_count
+        out.append({**entity_row(entity), "mentions": dialog.unread_mentions_count, "messages": rows})
+
+    if emit(out, args):
+        return
+    for chat in out:
+        print(f"\n# {chat['title']} ({chat['kind']}, id={chat['id']}) — {chat['mentions']} mention(s)")
+        for r in chat["messages"]:
+            print(f"[{r['date']}] <- {r['sender']} (msg {r['id']})")
+            print(f"    {r['text']}")
+    print(f"\n-- {total} unread mention(s) in {len(out)} chat(s)", file=sys.stderr)
+
+
+async def cmd_transcribe(cli, args) -> None:
+    """Turn a voice or video note into text with Telegram's own recogniser.
+
+    A voice message is a blank `[voice]` to anything reading text, which is
+    most of what an assistant is. Telegram transcribes server-side for Premium
+    accounts (and gives others a few free tries a week). The first call often
+    answers "pending"; asking again returns the same transcription once it is
+    done, so this polls rather than subscribing to the update.
+    """
+    entity = await resolve(cli, args.chat)
+    msgs = await cli.get_messages(entity, ids=[args.message])
+    msg = msgs[0] if msgs else None
+    if msg is None:
+        die(f"message {args.message} not found in {label(entity)}")
+    if not (getattr(msg, "voice", None) or getattr(msg, "video_note", None) or getattr(msg, "audio", None)):
+        die(f"message {args.message} is not a voice, audio or video note")
+
+    loop = asyncio.get_running_loop()
+    deadline = loop.time() + args.timeout
+    try:
+        res = await cli(TranscribeAudioRequest(peer=entity, msg_id=args.message))
+        while getattr(res, "pending", False) and loop.time() < deadline:
+            await asyncio.sleep(2)
+            res = await cli(TranscribeAudioRequest(peer=entity, msg_id=args.message))
+    except errors.RPCError as exc:
+        if "PREMIUM" in str(exc).upper():
+            die("transcription needs Telegram Premium (or a free trial this week)")
+        raise
+    row = {
+        "chat": entity_row(entity),
+        "message_id": args.message,
+        "pending": bool(getattr(res, "pending", False)),
+        "text": res.text,
+        "trial_remains": getattr(res, "trial_remains_num", None),
+    }
+    result(args, row, res.text + ("\n(still pending — run it again)" if row["pending"] else ""))
+
+
+# --- drafts: the reply Parham sends himself ---------------------------------
+
+
+async def cmd_draft(cli, args) -> None:
+    """Write a reply into a chat's input box, for Parham to read and send.
+
+    This is the safest thing an assistant can do with a reply: the text lands
+    in the chat's draft on every device he is logged in to, nobody else sees
+    it, and nothing goes out until he presses send himself. With no --chat it
+    lists the drafts that are waiting.
+
+    Setting one replaces whatever he had half-typed in that chat, which is the
+    one thing here that cannot be undone, so it is a dry run until --yes and
+    the preview shows what is there now.
+    """
+    if not args.chat:
+        rows = []
+        async for draft in cli.iter_drafts():
+            if not draft.text:
+                continue
+            rows.append({**entity_row(draft.entity), "date": ts(draft.date), "text": draft.text})
+        if emit(rows, args):
+            return
+        for r in rows:
+            print(f"{r['id']:>16}  {r['title']}  ({r['date']})")
+            print(f"    {r['text']}")
+        print(f"\n-- {len(rows)} draft(s)", file=sys.stderr)
+        return
+
+    entity = await resolve(cli, args.chat)
+    current = await cli.get_drafts(entity)
+    before = getattr(current, "text", "") or ""
+    if args.clear:
+        text, entities = "", []
+    else:
+        text, entities = build_message(message_text(args), args.parse, args.quote, args.expandable)
+
+    say(args, "about to " + ("clear the draft" if args.clear else "write a draft"))
+    say(args, f"  chat   : {label(entity)} ({kind(entity)}, id={entity.id})")
+    say(args, f"  now    : {before or '(empty)'}")
+    if not args.clear:
+        say(args, f"  draft  : {text}")
+        say(args, "  note   : only Parham sees a draft; nothing is sent")
+    plan = {"chat": entity_row(entity), "before": before, "text": text, "reply_to": args.reply_to}
+    if not args.yes:
+        dry_run(args, plan, "DRY RUN — draft untouched. Re-run with --yes to write it.")
+        return
+
+    await cli(
+        SaveDraftRequest(
+            peer=entity,
+            message=text,
+            entities=entities or None,
+            reply_to=InputReplyToMessage(reply_to_msg_id=args.reply_to) if args.reply_to else None,
+        )
+    )
+    result(
+        args,
+        {**plan, "dry_run": False},
+        "draft cleared" if args.clear else "draft saved — it is in the chat's input box",
+    )
+
+
+# --- chat housekeeping: pin, mute, archive, join, leave ----------------------
+
+
+async def cmd_pin(cli, args) -> None:
+    """Pin or unpin one message. Everyone in the chat sees a pin."""
+    entity = await resolve(cli, args.chat)
+    msgs = await cli.get_messages(entity, ids=[args.message])
+    target = msgs[0] if msgs else None
+    if target is None:
+        die(f"message {args.message} not found in {label(entity)}")
+    verb = "unpin" if args.unpin else "pin"
+    say(args, f"about to {verb}")
+    say(args, f"  chat   : {label(entity)} ({kind(entity)}, id={entity.id})")
+    say(args, f"  message: {args.message}: {body(target)[:200]}")
+    if not args.unpin:
+        say(args, f"  notify : {'nobody (silent)' if args.silent else 'members get a notification'}")
+    plan = {"chat": entity_row(entity), "message_id": args.message, "action": verb, "silent": args.silent}
+    if not args.yes:
+        dry_run(args, plan, f"DRY RUN — nothing {verb}ned. Re-run with --yes to apply.")
+        return
+    try:
+        if args.unpin:
+            await cli.unpin_message(entity, args.message)
+        else:
+            await cli.pin_message(entity, args.message, notify=not args.silent)
+    except errors.ChatAdminRequiredError:
+        die(f"pinning in {label(entity)} needs admin rights there")
+    result(args, {**plan, "dry_run": False}, f"{verb}ned message {args.message}")
+
+
+_DURATION = re.compile(r"(\d+)\s*([smhdw])")
+_UNITS = {"s": "seconds", "m": "minutes", "h": "hours", "d": "days", "w": "weeks"}
+
+#: Telegram's "forever": the largest 32-bit timestamp, which is what the apps send.
+MUTE_FOREVER = 2**31 - 1
+
+
+def parse_duration(text: str) -> timedelta:
+    """'8h', '1d12h', '30m', '2w' -> a timedelta. Refuses anything else."""
+    raw = text.strip().lower().replace(" ", "")
+    parts = _DURATION.findall(raw)
+    if not parts or "".join(n + u for n, u in parts) != raw:
+        die(f"--for wants a duration like 30m, 8h, 1d or 2w, got {text!r}")
+    total = timedelta()
+    for n, u in parts:
+        total += timedelta(**{_UNITS[u]: int(n)})
+    return total
+
+
+def mute_until(duration: str | None, off: bool) -> int:
+    """The mute_until value for a chat: 0 unmutes, MUTE_FOREVER is forever."""
+    if off:
+        return 0
+    if not duration or duration.lower() in ("forever", "always", "inf"):
+        return MUTE_FOREVER
+    return int((datetime.now(UTC) + parse_duration(duration)).timestamp())
+
+
+async def cmd_mute(cli, args) -> None:
+    """Mute or unmute a chat's notifications. Only Parham's devices notice."""
+    entity = await resolve(cli, args.chat)
+    until = mute_until(args.for_, args.off)
+    when = "unmuted" if until == 0 else "forever" if until == MUTE_FOREVER else ts(datetime.fromtimestamp(until, UTC))
+    plan = {"chat": entity_row(entity), "mute_until": when}
+    say(args, f"about to {'unmute' if until == 0 else 'mute'} {label(entity)} — {when}")
+    if not args.yes:
+        dry_run(args, plan, "DRY RUN — nothing changed. Re-run with --yes to apply.")
+        return
+    peer = InputNotifyPeer(await cli.get_input_entity(entity))
+    await cli(UpdateNotifySettingsRequest(peer=peer, settings=InputPeerNotifySettings(mute_until=until)))  # ty: ignore[invalid-argument-type]
+    result(args, {**plan, "dry_run": False}, f"{'unmuted' if until == 0 else 'muted until ' + when}: {label(entity)}")
+
+
+async def cmd_archive(cli, args) -> None:
+    """Move chats into the Archive, or back out. Only Parham's chat list changes."""
+    folder = 0 if args.unarchive else 1
+    entities = [await resolve(cli, ref) for ref in args.chat]
+    verb = "unarchive" if args.unarchive else "archive"
+    for e in entities:
+        say(args, f"about to {verb}: {label(e)} ({kind(e)}, id={e.id})")
+    plan = {"action": verb, "chats": [entity_row(e) for e in entities]}
+    if not args.yes:
+        dry_run(args, plan, "DRY RUN — nothing moved. Re-run with --yes to apply.")
+        return
+    for e in entities:
+        await cli.edit_folder(e, folder)
+    result(args, {**plan, "dry_run": False}, f"{verb}d {len(entities)} chat(s)")
+
+
+_INVITE = re.compile(r"(?:t\.me/(?:\+|joinchat/)|tg://join\?invite=)([\w-]+)")
+
+
+async def cmd_join(cli, args) -> None:
+    """Join a public group or channel, or a private one through an invite link."""
+    ref = args.link.strip()
+    invite = _INVITE.search(ref)
+    say(args, f"about to join: {ref}")
+    say(args, "  note   : the group sees Parham join; leaving is `leave`")
+    plan = {"link": ref, "invite": bool(invite)}
+    if not args.yes:
+        dry_run(args, plan, "DRY RUN — not joined. Re-run with --yes to join.")
+        return
+    if invite:
+        try:
+            res = await cli(ImportChatInviteRequest(invite.group(1)))
+        except errors.UserAlreadyParticipantError:
+            die("already a member of that chat")
+        chat = res.chats[0]
+    else:
+        chat = await cli.get_entity(ref)
+        if isinstance(chat, User):
+            die(f"{ref} is a person, not a group or channel")
+        await cli(JoinChannelRequest(chat))
+    index_put(chat)
+    result(args, {**plan, "dry_run": False, "chat": entity_row(chat)}, f"joined: {label(chat)} (id={chat.id})")
+
+
+async def cmd_leave(cli, args) -> None:
+    """Leave a group or channel. Its members see Parham leave."""
+    entity = await resolve(cli, args.chat)
+    if isinstance(entity, User):
+        die("that is a private chat — there is nothing to leave. To hide it, use `archive`.")
+    say(args, f"about to leave: {label(entity)} ({kind(entity)}, id={entity.id})")
+    say(args, "  note   : a private group needs a new invite to come back")
+    plan = {"chat": entity_row(entity)}
+    if not args.yes:
+        dry_run(args, plan, "DRY RUN — still a member. Re-run with --yes to leave.")
+        return
+    await cli.delete_dialog(entity)
+    result(args, {**plan, "dry_run": False}, f"left: {label(entity)}")
+
+
+# --- people: who is in a group, who someone is, and Parham's own profile -----
+
+
+def status_text(user) -> str | None:
+    """Last seen, in words, from a User's status object."""
+    status = getattr(user, "status", None)
+    if status is None:
+        return None
+    name = type(status).__name__.replace("UserStatus", "").lower()
+    if name == "offline" and getattr(status, "was_online", None):
+        return f"last seen {ts(status.was_online)}"
+    if name == "online":
+        return "online"
+    return {
+        "recently": "last seen recently",
+        "lastweek": "last seen within a week",
+        "lastmonth": "last seen within a month",
+    }.get(name, name)
+
+
+def role_of(user) -> str:
+    """creator / admin / member, from the participant telethon attaches."""
+    part = type(getattr(user, "participant", None)).__name__.lower()
+    if "creator" in part:
+        return "creator"
+    if "admin" in part:
+        return "admin"
+    if "banned" in part:
+        return "banned"
+    return "member"
+
+
+async def cmd_members(cli, args) -> None:
+    """Who is in a group, with their role; --admins narrows it to the admins."""
+    entity = await resolve(cli, args.chat)
+    if isinstance(entity, User):
+        die("a private chat has no member list")
+    kwargs = {"filter": ChannelParticipantsAdmins()} if args.admins else {}
+    rows = []
+    try:
+        async for user in cli.iter_participants(entity, limit=args.limit, search=args.query or "", **kwargs):
+            rows.append({**entity_row(user), "role": role_of(user), "status": status_text(user)})
+    except errors.ChatAdminRequiredError:
+        die(f"the member list of {label(entity)} is visible to its admins only")
+    if rows:
+        save_index(
+            {
+                **load_index(),
+                **{str(r["id"]): {k: r[k] for k in ("id", "title", "username", "kind", "forum")} for r in rows},
+            }
+        )
+    if emit(rows, args):
+        return
+    for r in rows:
+        role = f"  [{r['role']}]" if r["role"] != "member" else ""
+        print(f"{r['id']:>16}  {r['title']}{role}  {r['status'] or ''}")
+    print(f"\n-- {len(rows)} member(s) of {label(entity)}", file=sys.stderr)
+
+
+async def cmd_info(cli, args) -> None:
+    """Everything known about one person, group or channel, in one place.
+
+    The bio, the phone, when they were last seen and how many groups Parham
+    shares with them for a person; the description and member count for a
+    group. It is what an assistant should read before writing to someone it
+    has not written to before.
+    """
+    entity = await resolve(cli, args.chat)
+    row: dict = {**entity_row(entity)}
+    if isinstance(entity, User):
+        full = (await cli(GetFullUserRequest(entity))).full_user
+        row |= {
+            "first_name": entity.first_name,
+            "last_name": entity.last_name,
+            "phone": f"+{entity.phone}" if entity.phone else None,
+            "bio": full.about,
+            "status": status_text(entity),
+            "contact": bool(entity.contact),
+            "mutual_contact": bool(entity.mutual_contact),
+            "premium": bool(getattr(entity, "premium", False)),
+            "verified": bool(entity.verified),
+            "bot": bool(entity.bot),
+            "common_chats": full.common_chats_count,
+            "blocked": bool(full.blocked),
+        }
+    elif isinstance(entity, Chat):
+        full = (await cli(GetFullChatRequest(entity.id))).full_chat
+        row |= {"about": full.about, "members": getattr(entity, "participants_count", None)}
+    else:
+        full = (await cli(GetFullChannelRequest(entity))).full_chat
+        row |= {
+            "about": full.about,
+            "members": full.participants_count,
+            "admins": full.admins_count,
+            "online": getattr(full, "online_count", None),
+            "linked_chat_id": full.linked_chat_id,
+            "slowmode_seconds": full.slowmode_seconds,
+        }
+    if emit(row, args):
+        return
+    width = max(len(k) for k in row)
+    for key, value in row.items():
+        if value not in (None, "", False):
+            print(f"{key:<{width}} : {value}")
+
+
+async def cmd_profile(cli, args) -> None:
+    """Show Parham's own profile, or change his name, bio or username.
+
+    Every contact sees the change, so writes are a dry run until --yes.
+    """
+    me = await cli.get_me()
+    full = (await cli(GetFullUserRequest(me))).full_user
+    now = {"first_name": me.first_name, "last_name": me.last_name, "bio": full.about, "username": me.username}
+    wanted = {
+        k: v
+        for k, v in (
+            ("first_name", args.first),
+            ("last_name", args.last),
+            ("bio", args.bio),
+            ("username", args.username),
+        )
+        if v is not None
+    }
+    if not wanted:
+        result(args, {**entity_row(me), **now}, "\n".join(f"{k:<10} : {v or ''}" for k, v in now.items()))
+        return
+
+    say(args, "about to change the profile — every contact sees this")
+    for key, value in wanted.items():
+        say(args, f"  {key:<10}: {now[key] or '(empty)'} -> {value or '(empty)'}")
+    plan = {"before": now, "after": {**now, **wanted}}
+    if not args.yes:
+        dry_run(args, plan, "DRY RUN — profile unchanged. Re-run with --yes to apply.")
+        return
+    fields = {k: wanted[k] for k in ("first_name", "last_name") if k in wanted}
+    if "bio" in wanted:
+        fields["about"] = wanted["bio"]
+    if fields:
+        await cli(UpdateProfileRequest(**fields))
+    if "username" in wanted:
+        try:
+            await cli(UpdateUsernameRequest(wanted["username"].lstrip("@")))
+        except errors.UsernameOccupiedError:
+            die(f"@{wanted['username']} is taken")
+    result(args, {**plan, "dry_run": False}, "profile updated")
+
+
+# --- polls -------------------------------------------------------------------
+
+
+def build_poll(question: str, options: list[str], multiple: bool, public: bool, quiz: int | None):
+    """An InputMediaPoll. Answers are identified by one byte each, 0..n-1."""
+    if not 2 <= len(options) <= 12:
+        die("a poll needs between 2 and 12 --option values")
+    if quiz is not None and not 0 <= quiz < len(options):
+        die(f"--quiz wants the index of the right answer, 0..{len(options) - 1}")
+    if quiz is not None and multiple:
+        die("a quiz has one right answer; drop --multiple")
+    poll = Poll(
+        id=random.getrandbits(62),
+        question=TextWithEntities(text=question, entities=[]),
+        answers=[
+            PollAnswer(text=TextWithEntities(text=o, entities=[]), option=bytes([i])) for i, o in enumerate(options)
+        ],
+        hash=0,
+        multiple_choice=multiple or None,
+        public_voters=public or None,
+        quiz=(quiz is not None) or None,
+    )
+    return InputMediaPoll(poll=poll, correct_answers=[quiz] if quiz is not None else None)
+
+
+async def cmd_poll(cli, args) -> None:
+    """Send a poll (or a quiz) as Parham."""
+    entity = await resolve(cli, args.chat)
+    media = build_poll(args.question, args.option, args.multiple, args.public, args.quiz)
+    topic = await target_topic(cli, entity, args)
+    say(args, "about to send a poll")
+    say(args, f"  chat    : {label(entity)} ({kind(entity)}, id={entity.id})")
+    say(args, f"  question: {args.question}")
+    for i, option in enumerate(args.option):
+        say(args, f"  {i}. {option}{'  ✓' if args.quiz == i else ''}")
+    plan = {"chat": entity_row(entity), "question": args.question, "options": args.option, "topic": topic}
+    if not args.yes:
+        dry_run(args, plan, "DRY RUN — nothing sent. Re-run with --yes to actually deliver.")
+        return
+    msg = await cli.send_file(entity, media, reply_to=send_reply_to(args.reply_to, topic["id"] if topic else None))
+    result(args, {**plan, "dry_run": False, "message_id": msg.id}, f"poll sent: message_id={msg.id}")
+
+
+# --- streaming and export ----------------------------------------------------
+
+
+async def cmd_listen(cli, args) -> None:
+    """Wait for new messages and print each as it arrives.
+
+    The other commands look back; this looks forward, which is what an agent
+    needs to wait for an answer it just asked for. With --json each message is
+    one JSON object on its own line (JSON Lines), printed and flushed the moment
+    it arrives. It stops after --count messages or --timeout seconds; under the
+    MCP server it never waits longer than a minute unless told to, because a
+    tool call cannot be interrupted.
+    """
+    chats = [await resolve(cli, ref) for ref in args.chat or []]
+    me = await cli.get_me()
+    timeout = args.timeout
+    if timeout is None and args.count is None and IN_MCP:
+        timeout = 60
+    queue: asyncio.Queue = asyncio.Queue()
+
+    async def on_message(event) -> None:
+        await queue.put(event.message)
+
+    builder = events.NewMessage(chats=chats or None, incoming=True if args.incoming else None)
+    cli.add_event_handler(on_message, builder)
+    say(
+        args,
+        f"listening on {', '.join(label(c) for c in chats) or 'every chat'}"
+        + (f" for {timeout}s" if timeout else "")
+        + (f", up to {args.count} message(s)" if args.count else ""),
+    )
+    loop = asyncio.get_running_loop()
+    deadline = loop.time() + timeout if timeout else None
+    seen = 0
+    try:
+        while args.count is None or seen < args.count:
+            wait = None if deadline is None else deadline - loop.time()
+            if wait is not None and wait <= 0:
+                break
+            try:
+                msg = await asyncio.wait_for(queue.get(), timeout=wait)
+            except TimeoutError:
+                break
+            chat = await msg.get_chat()
+            row = {**msg_row(msg, me.id), "chat": label(chat), "chat_id": getattr(chat, "id", None)}
+            seen += 1
+            if getattr(args, "json", False):
+                print(json.dumps(row, ensure_ascii=False, default=str), flush=True)
+            else:
+                print(f"[{row['date']}] {row['chat']} — {row['sender']} (msg {row['id']})", flush=True)
+                print(f"    {row['text']}", flush=True)
+    finally:
+        cli.remove_event_handler(on_message, builder)
+    say(args, f"-- {seen} message(s)")
+
+
+def export_markdown(entity, rows: list[dict]) -> str:
+    lines = [f"# {label(entity)}", ""]
+    for r in rows:
+        lines.append(f"**{r['sender']}** — {r['date']} (msg {r['id']})")
+        lines.append("")
+        lines.append(r["text"])
+        if r.get("file"):
+            lines.append(f"[{r['file']}]({r['file']})")
+        lines.append("")
+    return "\n".join(lines)
+
+
+async def cmd_export(cli, args) -> None:
+    """Save a whole conversation to a file, oldest first.
+
+    `history` is for reading a screenful; this is for keeping one: JSON Lines
+    for a program (one message per line, the same fields as `history --json`)
+    or Markdown for a person, with the media saved beside it on request.
+    """
+    entity = await resolve(cli, args.chat)
+    me = await cli.get_me()
+    since = parse_when(args.since, "--since")
+    until = parse_when(args.until, "--until")
+    out = Path(args.out).expanduser()
+    out.parent.mkdir(parents=True, exist_ok=True)
+    media_dir = Path(args.media).expanduser() if args.media else None
+    if media_dir:
+        media_dir.mkdir(parents=True, exist_ok=True)
+
+    rows = []
+    async for msg in cli.iter_messages(entity, reverse=True, offset_date=since, limit=args.limit or None):
+        if until and msg.date and msg.date.astimezone(UTC) > until:
+            break
+        row = msg_row(msg, me.id)
+        if media_dir and msg.media:
+            path = await cli.download_media(msg, file=str(media_dir))
+            if path:
+                row["file"] = str(path)
+        rows.append(row)
+        if len(rows) % 500 == 0:
+            say(args, f"  {len(rows)} message(s)…")
+
+    if args.format == "md":
+        out.write_text(export_markdown(entity, rows) + "\n")
+    else:
+        out.write_text("".join(json.dumps(r, ensure_ascii=False, default=str) + "\n" for r in rows))
+    result(
+        args,
+        {"chat": entity_row(entity), "path": str(out), "format": args.format, "messages": len(rows)},
+        f"exported {len(rows)} message(s) from {label(entity)} to {out}",
+    )
+
+
+# --------------------------------------------------------------------------
+# AI interface: the command line as tools, over MCP or as a JSON schema
+# --------------------------------------------------------------------------
+#
+# Every subcommand is already a tool: a name, a help line, typed flags, a
+# --json result and a --yes gate on anything that writes. So the tool list is
+# *generated from the argument parser* rather than written a second time — a
+# flag added to the CLI is a parameter the agent can use, with no second copy
+# to drift. `mcp` serves that list over the Model Context Protocol (JSON-RPC on
+# stdio, which Claude Code, Claude Desktop and most agent frameworks speak);
+# `schema` prints the same list for anything that wants function definitions
+# instead (OpenAI-style tools, a prompt, a test).
+
+#: Commands that make no sense as a tool: login is interactive by nature, and
+#: the server cannot serve itself.
+NOT_TOOLS = {"setup", "login", "mcp", "schema", "accounts"}
+
+MCP_PROTOCOLS = ("2025-06-18", "2025-03-26", "2024-11-05")
+
+MCP_INSTRUCTIONS = """\
+These tools act on the user's own Telegram account: whatever they send appears as the user typing it.
+
+- Every write (send, send_file, edit, delete, forward, react, draft, pin, mute, archive, join, leave, poll, \
+profile, folder, chat_photo, create_group, sessions with terminate) is a DRY RUN unless `yes` is true. \
+Call it without `yes` first, show the user the recipient and the exact text from the preview, and call again \
+with `yes: true` only after they agree. Never compose and deliver in one step.
+- When a reply is wanted but not yet approved, prefer `draft`: it puts the text in the chat's input box for \
+the user to send themselves, and nobody else sees it.
+- `chat` takes an alias, @username, t.me link, numeric id, "me" (Saved Messages) or a title. If a title \
+matches several chats the call fails with the candidates — ask which one; never guess a recipient.
+- Start with `catchup` (unread), `mentions` (unread @mentions) or `chats`; read a thread with `history`, a \
+specific message with `get`, a voice note with `transcribe`. `listen` waits for new messages (bounded to 60s \
+unless `timeout`/`count` is given).
+- Message text uses Telegram markdown: **bold**, __italic__, ~~strike~~, ||spoiler||, `code`, ```lang fences, \
+[label](url), and lines starting with > as a quote. Single * and _ are literal. Pass parse="none" for logs.
+"""
+
+
+def subcommands(parser: argparse.ArgumentParser) -> dict[str, tuple[argparse.ArgumentParser, str]]:
+    """name -> (subparser, its one-line help), straight from the parser."""
+    for action in parser._actions:
+        if isinstance(action, argparse._SubParsersAction):
+            helps = {a.dest: a.help or "" for a in action._choices_actions}
+            return {name: (sp, helps.get(name, "")) for name, sp in action.choices.items()}
+    raise AssertionError("the parser has no subcommands")
+
+
+def _option(action) -> str:
+    return next((o for o in action.option_strings if o.startswith("--")), action.option_strings[0])
+
+
+def param_schema(action) -> dict:
+    """One argparse action as a JSON-schema property."""
+    item: dict = {"type": "integer"} if action.type is int else {"type": "string"}
+    schema: dict = {}
+    if isinstance(action, argparse._StoreTrueAction):
+        schema["type"] = "boolean"
+    elif isinstance(action, argparse._AppendAction):
+        schema |= {"type": "array", "items": item}
+    elif action.nargs == 2:
+        schema |= {"type": "array", "items": {"type": "string"}, "minItems": 2, "maxItems": 2}
+    else:
+        schema |= item
+    if action.choices is not None and not isinstance(action, argparse._StoreTrueAction):
+        choices = list(action.choices)
+        # An append action's schema holds `item` itself, so the enum lands on
+        # each element rather than on the array.
+        (item if isinstance(action, argparse._AppendAction) else schema)["enum"] = choices
+    help_text = (action.help or "").replace("%%", "%")
+    if action.default not in (None, False, argparse.SUPPRESS) and not isinstance(action, argparse._StoreTrueAction):
+        help_text = f"{help_text} (default: {action.default})".strip()
+    if help_text:
+        schema["description"] = help_text
+    return schema
+
+
+def tool_name(cmd: str) -> str:
+    return cmd.replace("-", "_")
+
+
+def tool_specs(parser: argparse.ArgumentParser | None = None) -> list[dict]:
+    """MCP tool definitions for every subcommand worth exposing."""
+    parser = parser or build_parser()
+    tools = []
+    for cmd, (sp, help_text) in subcommands(parser).items():
+        if cmd in NOT_TOOLS:
+            continue
+        props, required = {}, []
+        writes = False
+        for action in sp._actions:
+            if isinstance(action, argparse._HelpAction) or action.dest == "json" or not action.option_strings:
+                continue
+            props[action.dest] = param_schema(action)
+            writes = writes or action.dest == "yes"
+            if action.required:
+                required.append(action.dest)
+        desc = help_text[:1].upper() + help_text[1:] + "."
+        if writes:
+            desc += " Dry run unless yes=true: show the user the preview first, then repeat with yes=true."
+        tools.append(
+            {
+                "name": tool_name(cmd),
+                "description": desc,
+                "inputSchema": {
+                    "type": "object",
+                    "properties": props,
+                    "required": required,
+                    "additionalProperties": False,
+                },
+                "annotations": {"readOnlyHint": not writes, "openWorldHint": True},
+            }
+        )
+    return tools
+
+
+def tool_argv(parser: argparse.ArgumentParser, name: str, arguments: dict) -> list[str]:
+    """Turn a tool call back into the command line it stands for (+ --json)."""
+    cmds = {tool_name(c): c for c in subcommands(parser) if c not in NOT_TOOLS}
+    if name not in cmds:
+        raise ValueError(f"unknown tool {name!r}")
+    cmd = cmds[name]
+    sp = subcommands(parser)[cmd][0]
+    actions = {a.dest: a for a in sp._actions if a.option_strings and not isinstance(a, argparse._HelpAction)}
+    argv = [cmd]
+    for key, value in (arguments or {}).items():
+        action = actions.get(key)
+        if action is None:
+            raise ValueError(f"{name} has no parameter {key!r}")
+        if value is None:
+            continue
+        opt = _option(action)
+        if isinstance(action, argparse._StoreTrueAction):
+            if value:
+                argv.append(opt)
+        elif isinstance(action, argparse._AppendAction):
+            for v in value if isinstance(value, list) else [value]:
+                argv += [opt, str(v)]
+        elif action.nargs == 2:
+            argv += [opt, *map(str, value)]
+        else:
+            argv += [opt, str(value)]
+    if "json" in {a.dest for a in sp._actions}:
+        argv.append("--json")
+    return argv
+
+
+async def call_tool(cli, parser: argparse.ArgumentParser, name: str, arguments: dict) -> dict:
+    """Run one tool call on the open client and wrap its output as MCP content.
+
+    The command runs exactly as it would from a shell, with stdout and stderr
+    captured: stdout is the JSON result, stderr the narration (the dry-run
+    block, notes). `die` raises SystemExit, which here is a failed call rather
+    than the end of the server.
+    """
+    global JSON_ERRORS
+    out, err = io.StringIO(), io.StringIO()
+    failed = False
+    try:
+        argv = tool_argv(parser, name, arguments)
+    except ValueError as exc:
+        return {"content": [{"type": "text", "text": str(exc)}], "isError": True}
+    with contextlib.redirect_stdout(out), contextlib.redirect_stderr(err):
+        try:
+            args = parser.parse_args(argv)
+            JSON_ERRORS = bool(getattr(args, "json", False))
+            await args.fn(cli, args)
+        except SystemExit as exc:
+            failed = exc.code not in (0, None)
+        except errors.FloodWaitError as exc:
+            failed = True
+            print(f"rate limited by Telegram; retry in {exc.seconds}s", file=sys.stderr)
+        except errors.RPCError as exc:
+            failed = True
+            print(f"Telegram error: {exc}", file=sys.stderr)
+        finally:
+            JSON_ERRORS = False
+    content = []
+    if out.getvalue().strip():
+        content.append({"type": "text", "text": out.getvalue().strip()})
+    if err.getvalue().strip():
+        content.append({"type": "text", "text": err.getvalue().strip()})
+    if not content:
+        content.append({"type": "text", "text": "done"})
+    return {"content": content, "isError": failed}
+
+
+async def mcp_handle(cli, parser, specs: list[dict], msg: dict) -> dict | None:
+    """One JSON-RPC message in, the response out (None for a notification)."""
+    method, rid, params = msg.get("method"), msg.get("id"), msg.get("params") or {}
+    if rid is None:
+        return None  # notifications/initialized, cancelled, …: nothing to answer
+    if method == "initialize":
+        asked = params.get("protocolVersion")
+        res: dict = {
+            "protocolVersion": asked if asked in MCP_PROTOCOLS else MCP_PROTOCOLS[0],
+            "capabilities": {"tools": {"listChanged": False}},
+            "serverInfo": {"name": "elbot", "title": "ELBoT — Telegram secretary", "version": VERSION},
+            "instructions": MCP_INSTRUCTIONS,
+        }
+    elif method == "ping":
+        res = {}
+    elif method == "tools/list":
+        res = {"tools": specs}
+    elif method == "tools/call":
+        res = await call_tool(cli, parser, params.get("name", ""), params.get("arguments") or {})
+    else:
+        return {"jsonrpc": "2.0", "id": rid, "error": {"code": -32601, "message": f"method not found: {method}"}}
+    return {"jsonrpc": "2.0", "id": rid, "result": res}
+
+
+async def cmd_mcp(cli, args) -> None:
+    """Serve every command as an MCP tool on stdin/stdout.
+
+    One connection stays open for the whole session, so a tool call costs one
+    round trip to Telegram instead of a fresh login handshake each time. Calls
+    run one at a time, in order — the commands share the client and the
+    title cache, and Telegram's flood limits punish bursts anyway.
+
+        claude mcp add elbot -- uv run /path/to/topoli_user.py mcp
+    """
+    global IN_MCP
+    IN_MCP = True
+    wire = sys.stdout  # captured before any call redirects stdout
+    parser = build_parser()
+    specs = tool_specs(parser)
+    loop = asyncio.get_running_loop()
+    me = await cli.get_me()
+    print(
+        f"elbot mcp [{ACCOUNT}]: serving {len(specs)} tools as {label(me)} ({device_identity()['device_model']})",
+        file=sys.stderr,
+    )
+    while True:
+        line = await loop.run_in_executor(None, sys.stdin.readline)
+        if not line:
+            break
+        if not line.strip():
+            continue
+        try:
+            msg = json.loads(line)
+        except json.JSONDecodeError as exc:
+            reply: dict | None = {"jsonrpc": "2.0", "id": None, "error": {"code": -32700, "message": str(exc)}}
+        else:
+            reply = await mcp_handle(cli, parser, specs, msg)
+        if reply is not None:
+            wire.write(json.dumps(reply, ensure_ascii=False, default=str) + "\n")
+            wire.flush()
+
+
+async def cmd_schema(cli, args) -> None:  # never reaches the network
+    """Print the tool definitions, for an agent framework that is not MCP."""
+    specs = tool_specs()
+    if args.format == "openai":
+        specs = [
+            {
+                "type": "function",
+                "function": {"name": t["name"], "description": t["description"], "parameters": t["inputSchema"]},
+            }
+            for t in specs
+        ]
+    elif args.format == "anthropic":
+        specs = [{"name": t["name"], "description": t["description"], "input_schema": t["inputSchema"]} for t in specs]
+    print(json.dumps(specs, ensure_ascii=False, indent=2))
 
 
 # --------------------------------------------------------------------------
@@ -1716,10 +3040,32 @@ def add_json(sp):
 
 #: Shared so `send` and `send-file` cannot drift into describing it differently.
 TOPIC_HELP = 'forum topic to post into: its id, its title, or "general". Run `topics` to list them'
+CHAT_HELP = 'alias, @username, t.me link, numeric id, "me" (Saved Messages), or chat title'
+
+
+def add_text(sp, required: bool = True) -> None:
+    """--text or --text-file, plus the markup flags every message-writing command shares."""
+    g = sp.add_mutually_exclusive_group(required=required)
+    g.add_argument("--text", help="the message text")
+    g.add_argument("--text-file", help="read the text from this file (- for stdin); safest for quotes and $")
+    sp.add_argument(
+        "--parse",
+        default="markdown",
+        choices=PARSE_CHOICES,
+        help="text markup: markdown (default; ** __ ~~ || ` ```lang [t](url) and > lines), html, or none",
+    )
+    sp.add_argument("--quote", action="store_true", help="wrap the whole message in a blockquote")
+    sp.add_argument("--expandable", action="store_true", help="collapsed tap-to-expand blockquote (implies --quote)")
 
 
 def build_parser() -> argparse.ArgumentParser:
     p = argparse.ArgumentParser(prog="topoli_user.py", description=__doc__.splitlines()[0])
+    p.add_argument(
+        "--account",
+        default=os.environ.get("TOPOLI_ACCOUNT"),
+        help=f"which login to act as: <name>.authkey beside the script (default: {DEFAULT_ACCOUNT}, or TOPOLI_ACCOUNT)",
+    )
+    p.add_argument("--version", action="version", version=f"elbot {VERSION}")
     sub = p.add_subparsers(dest="cmd", required=True)
 
     sp = sub.add_parser("setup", help="store api_id/api_hash from my.telegram.org")
@@ -1792,29 +3138,20 @@ def build_parser() -> argparse.ArgumentParser:
     sp.set_defaults(fn=cmd_topics)
 
     sp = sub.add_parser("send", help="send a message as yourself")
-    sp.add_argument("--chat", required=True, help="@username, t.me link, numeric id, or chat title")
-    sp.add_argument("--text", required=True)
-    sp.add_argument(
-        "--parse",
-        default="markdown",
-        choices=PARSE_CHOICES,
-        help="text markup: markdown (default; ** __ ~~ || ` ```lang [t](url) and > lines), html, or none",
-    )
-    sp.add_argument("--quote", action="store_true", help="wrap the whole message in a blockquote")
-    sp.add_argument("--expandable", action="store_true", help="collapsed tap-to-expand blockquote (implies --quote)")
-    sp.add_argument("--reply-to", type=int)
+    sp.add_argument("--chat", required=True, help=CHAT_HELP)
+    add_text(sp)
+    sp.add_argument("--reply-to", type=int, help="message id to reply to")
     sp.add_argument("--topic", help=TOPIC_HELP)
     sp.add_argument("--schedule", help="deliver later; ISO time like 2026-09-01T09:00")
+    sp.add_argument("--silent", action="store_true", help="deliver without a notification sound")
+    sp.add_argument("--no-preview", action="store_true", help="no link preview under the message")
     sp.add_argument("--yes", action="store_true", help="actually send (otherwise dry run)")
     sp.set_defaults(fn=cmd_send)
 
     sp = sub.add_parser("edit", help="rewrite one of your own messages in place")
     sp.add_argument("--chat", required=True)
     sp.add_argument("--message", required=True, type=int, help="message id, from `history`")
-    sp.add_argument("--text", required=True)
-    sp.add_argument("--parse", default="markdown", choices=PARSE_CHOICES)
-    sp.add_argument("--quote", action="store_true")
-    sp.add_argument("--expandable", action="store_true")
+    add_text(sp)
     sp.add_argument("--yes", action="store_true", help="actually edit (otherwise dry run)")
     sp.set_defaults(fn=cmd_edit)
 
@@ -1846,8 +3183,9 @@ def build_parser() -> argparse.ArgumentParser:
     sp.add_argument("--yes", action="store_true", help="actually react (otherwise dry run)")
     sp.set_defaults(fn=cmd_react)
 
-    sp = sub.add_parser("read", help="mark chats as read")
+    sp = sub.add_parser("read", help="mark chats as read (or --unread to bring the badge back)")
     sp.add_argument("--chat", action="append", required=True, help="repeat for several")
+    sp.add_argument("--unread", action="store_true", help="mark as unread instead; only you see this")
     sp.set_defaults(fn=cmd_read)
 
     sp = add_json(sub.add_parser("folders", help="list chat folders — Telegram's per-chat tags"))
@@ -1880,20 +3218,162 @@ def build_parser() -> argparse.ArgumentParser:
     sp.add_argument("--quote", action="store_true", help="wrap the caption in a blockquote")
     sp.add_argument("--expandable", action="store_true", help="collapsed blockquote (implies --quote)")
     sp.add_argument("--photo", action="store_true", help="send as photo (recompressed) not document")
+    sp.add_argument("--reply-to", type=int, help="message id to reply to")
+    sp.add_argument("--topic", help=TOPIC_HELP)
+    sp.add_argument("--silent", action="store_true", help="deliver without a notification sound")
+    sp.add_argument("--yes", action="store_true", help="actually send (otherwise dry run)")
+    sp.set_defaults(fn=cmd_send_file)
+
+    # --- the session ------------------------------------------------------
+    sp = sub.add_parser("accounts", help="the accounts this tool can act as, one per *.authkey")
+    sp.set_defaults(fn=cmd_accounts, offline=True)
+
+    sp = sub.add_parser("device", help="show or rename how this session appears in Telegram's device list")
+    sp.add_argument("--name", help='the device name others see, e.g. "Claude" or "ELBoT AI"')
+    sp.add_argument("--system", help='the system line under it, e.g. "AI secretary"')
+    sp.add_argument("--app", help='the app line, e.g. "ELBoT 0.3"')
+    sp.add_argument("--reset", action="store_true", help="forget the stored identity and use the default")
+    sp.add_argument("--local", action="store_true", help="store on this machine only, not beside the script")
+    sp.set_defaults(fn=cmd_device, offline=True)
+
+    sp = sub.add_parser("sessions", help="every device logged in to the account; log one out")
+    sp.add_argument("--terminate", type=int, metavar="HASH", help="log out the session with this hash")
+    sp.add_argument("--yes", action="store_true", help="actually log it out (otherwise dry run)")
+    sp.set_defaults(fn=cmd_sessions)
+
+    # --- reading more precisely --------------------------------------------
+    sp = sub.add_parser("get", help="fetch messages by id, with --context around them")
+    sp.add_argument("--chat", required=True, help=CHAT_HELP)
+    sp.add_argument("--message", action="append", required=True, type=int, help="message id; repeat for several")
+    sp.add_argument("--context", type=int, default=0, help="also show this many messages either side")
+    sp.set_defaults(fn=cmd_get)
+
+    sp = sub.add_parser("mentions", help="unread @mentions and replies to you, across every chat")
+    sp.add_argument("--limit", type=int, default=200, help="how many chats to scan")
+    sp.add_argument("--max-per-chat", type=int, default=20)
+    sp.set_defaults(fn=cmd_mentions)
+
+    sp = sub.add_parser("transcribe", help="voice or video note to text (Telegram Premium)")
+    sp.add_argument("--chat", required=True, help=CHAT_HELP)
+    sp.add_argument("--message", required=True, type=int, help="the voice message's id")
+    sp.add_argument("--timeout", type=int, default=30, help="seconds to wait for a pending transcription")
+    sp.set_defaults(fn=cmd_transcribe)
+
+    sp = sub.add_parser("members", help="who is in a group, with roles and last seen")
+    sp.add_argument("--chat", required=True, help=CHAT_HELP)
+    sp.add_argument("--query", help="filter by name")
+    sp.add_argument("--admins", action="store_true", help="admins only")
+    sp.add_argument("--limit", type=int, default=200)
+    sp.set_defaults(fn=cmd_members)
+
+    sp = sub.add_parser("info", help="bio, phone, last seen, members — everything about one chat or person")
+    sp.add_argument("--chat", required=True, help=CHAT_HELP)
+    sp.set_defaults(fn=cmd_info)
+
+    sp = sub.add_parser("listen", help="wait for new messages and print each as it arrives")
+    sp.add_argument("--chat", action="append", help="only this chat; repeatable (default: all)")
+    sp.add_argument("--incoming", action="store_true", help="ignore messages you send yourself")
+    sp.add_argument("--count", type=int, help="stop after this many messages")
+    sp.add_argument("--timeout", type=int, help="stop after this many seconds")
+    sp.set_defaults(fn=cmd_listen, cache="listen")
+
+    sp = sub.add_parser("export", help="save a whole conversation to JSON Lines or Markdown")
+    sp.add_argument("--chat", required=True, help=CHAT_HELP)
+    sp.add_argument("--out", required=True, help="the file to write")
+    sp.add_argument("--format", choices=("jsonl", "md"), default="jsonl")
+    sp.add_argument("--since", help="start at this ISO date")
+    sp.add_argument("--until", help="stop at this ISO date")
+    sp.add_argument("--limit", type=int, default=0, help="at most this many messages (0: all)")
+    sp.add_argument("--media", metavar="DIR", help="also download every file into DIR")
+    sp.set_defaults(fn=cmd_export)
+
+    # --- writing that only Parham sees, and housekeeping --------------------
+    sp = sub.add_parser("draft", help="put a reply in a chat's input box for you to send; no --chat lists drafts")
+    sp.add_argument("--chat", help=CHAT_HELP)
+    add_text(sp, required=False)
+    sp.add_argument("--reply-to", type=int, help="make the draft a reply to this message")
+    sp.add_argument("--clear", action="store_true", help="empty the draft instead")
+    sp.add_argument("--yes", action="store_true", help="actually write it (otherwise dry run)")
+    sp.set_defaults(fn=cmd_draft)
+
+    sp = sub.add_parser("pin", help="pin or unpin a message")
+    sp.add_argument("--chat", required=True, help=CHAT_HELP)
+    sp.add_argument("--message", required=True, type=int)
+    sp.add_argument("--unpin", action="store_true")
+    sp.add_argument("--silent", action="store_true", help="pin without notifying members")
+    sp.add_argument("--yes", action="store_true", help="actually apply (otherwise dry run)")
+    sp.set_defaults(fn=cmd_pin)
+
+    sp = sub.add_parser("mute", help="mute or unmute a chat's notifications")
+    sp.add_argument("--chat", required=True, help=CHAT_HELP)
+    sp.add_argument("--for", dest="for_", metavar="DURATION", help="30m, 8h, 1d, 2w, or forever (default)")
+    sp.add_argument("--off", action="store_true", help="unmute")
+    sp.add_argument("--yes", action="store_true", help="actually apply (otherwise dry run)")
+    sp.set_defaults(fn=cmd_mute)
+
+    sp = sub.add_parser("archive", help="move chats into the Archive, or out with --unarchive")
+    sp.add_argument("--chat", action="append", required=True, help="repeat for several")
+    sp.add_argument("--unarchive", action="store_true")
+    sp.add_argument("--yes", action="store_true", help="actually apply (otherwise dry run)")
+    sp.set_defaults(fn=cmd_archive)
+
+    sp = sub.add_parser("join", help="join a group or channel by @username or invite link")
+    sp.add_argument("--link", required=True, help="@name, t.me/name, or t.me/+invite")
+    sp.add_argument("--yes", action="store_true", help="actually join (otherwise dry run)")
+    sp.set_defaults(fn=cmd_join)
+
+    sp = sub.add_parser("leave", help="leave a group or channel")
+    sp.add_argument("--chat", required=True, help=CHAT_HELP)
+    sp.add_argument("--yes", action="store_true", help="actually leave (otherwise dry run)")
+    sp.set_defaults(fn=cmd_leave)
+
+    sp = sub.add_parser("profile", help="show your profile, or change name, bio or username")
+    sp.add_argument("--first", help="first name")
+    sp.add_argument("--last", help="last name")
+    sp.add_argument("--bio", help="the about line")
+    sp.add_argument("--username", help="the public @username")
+    sp.add_argument("--yes", action="store_true", help="actually apply (otherwise dry run)")
+    sp.set_defaults(fn=cmd_profile)
+
+    sp = sub.add_parser("poll", help="send a poll or a quiz")
+    sp.add_argument("--chat", required=True, help=CHAT_HELP)
+    sp.add_argument("--question", required=True)
+    sp.add_argument("--option", action="append", required=True, help="an answer; repeat 2-12 times")
+    sp.add_argument("--multiple", action="store_true", help="allow several answers")
+    sp.add_argument("--public", action="store_true", help="show who voted for what")
+    sp.add_argument("--quiz", type=int, metavar="INDEX", help="make it a quiz; INDEX of the right answer, from 0")
     sp.add_argument("--reply-to", type=int)
     sp.add_argument("--topic", help=TOPIC_HELP)
-    sp.add_argument("--yes", action="store_true")
-    sp.set_defaults(fn=cmd_send_file)
+    sp.add_argument("--yes", action="store_true", help="actually send (otherwise dry run)")
+    sp.set_defaults(fn=cmd_poll)
+
+    # --- the AI interface ---------------------------------------------------
+    sp = sub.add_parser("mcp", help="serve every command as an MCP tool on stdio (for Claude and other agents)")
+    sp.set_defaults(fn=cmd_mcp, cache="mcp")
+
+    sp = sub.add_parser("schema", help="print the tool definitions as JSON")
+    sp.add_argument("--format", choices=("mcp", "openai", "anthropic"), default="mcp")
+    sp.set_defaults(fn=cmd_schema, offline=True)
+
+    # --json on everything, writes included: a read prints its rows, a write
+    # its plan (dry run) or its outcome, and the narration moves to stderr.
+    for name, (child, _) in subcommands(p).items():
+        if name not in ("mcp", "schema", "setup") and not any(a.dest == "json" for a in child._actions):
+            add_json(child)
 
     return p
 
 
 async def run(args) -> None:
+    global JSON_ERRORS
+    JSON_ERRORS = bool(getattr(args, "json", False))
+    # `device` only talks to the network when it is asked to show the live
+    # session; renaming is a config write.
     if getattr(args, "offline", False):
         await args.fn(None, args)
         return
 
-    cli = client()
+    cli = client(getattr(args, "cache", None))
     # Deliberately connect() rather than `async with cli`: the context manager
     # calls start(), which prompts for a phone number on stdin. In a
     # non-interactive run that surfaces as an EOFError traceback instead of the
@@ -1902,7 +3382,7 @@ async def run(args) -> None:
     try:
         secure_session()
         if not await cli.is_user_authorized() and args.fn is not cmd_login:
-            die("not logged in yet. Run: uv run topoli_user.py login")
+            die(f"account {ACCOUNT!r} is not logged in yet. Run: {invocation()} login --phone <number>")
         await args.fn(cli, args)
     finally:
         await cli.disconnect()
@@ -1910,6 +3390,7 @@ async def run(args) -> None:
 
 def main() -> None:
     args = build_parser().parse_args()
+    set_account(args.account)
     try:
         asyncio.run(run(args))
     except KeyboardInterrupt:

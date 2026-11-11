@@ -9,8 +9,45 @@ import pytest
 
 import topoli_user as t
 
-WRITES = ["send", "send-file", "edit", "delete", "forward", "react", "create-group", "folder", "chat-photo"]
-READS = ["chats", "contacts", "catchup", "alias", "history", "search", "folders", "topics"]
+WRITES = [
+    "send",
+    "send-file",
+    "edit",
+    "delete",
+    "forward",
+    "react",
+    "create-group",
+    "folder",
+    "chat-photo",
+    "draft",
+    "pin",
+    "mute",
+    "archive",
+    "join",
+    "leave",
+    "profile",
+    "poll",
+    "sessions",
+]
+READS = [
+    "chats",
+    "contacts",
+    "catchup",
+    "alias",
+    "history",
+    "search",
+    "folders",
+    "topics",
+    "whoami",
+    "get",
+    "mentions",
+    "transcribe",
+    "members",
+    "info",
+    "listen",
+    "export",
+    "device",
+]
 
 MINIMAL = {
     "setup": ["--api-id", "1", "--api-hash", "0" * 32],
@@ -28,6 +65,17 @@ MINIMAL = {
     "folder": ["--name", "x"],
     "create-group": ["--title", "x"],
     "chat-photo": ["--chat", "me"],
+    "get": ["--chat", "me", "--message", "1"],
+    "transcribe": ["--chat", "me", "--message", "1"],
+    "members": ["--chat", "me"],
+    "info": ["--chat", "me"],
+    "export": ["--chat", "me", "--out", "x.jsonl"],
+    "pin": ["--chat", "me", "--message", "1"],
+    "mute": ["--chat", "me"],
+    "archive": ["--chat", "me"],
+    "join": ["--link", "@x"],
+    "leave": ["--chat", "me"],
+    "poll": ["--chat", "me", "--question", "q", "--option", "a", "--option", "b"],
 }
 
 
@@ -104,3 +152,40 @@ def test_chat_photo_reads_without_a_dry_run_and_writes_with_one():
 
     write = parse(["chat-photo", "--chat", "me", "--set", "logo.png", "--yes"])
     assert write.set == "logo.png" and write.yes is True
+
+
+@pytest.mark.parametrize("cmd", WRITES)
+def test_write_commands_offer_json_too(cmd):
+    """A write under --json prints its plan or outcome as one JSON object."""
+    assert parse([cmd, *MINIMAL.get(cmd, []), "--json"]).json is True
+
+
+def test_send_takes_its_text_from_a_file():
+    args = parse(["send", "--chat", "me", "--text-file", "reply.md"])
+    assert args.text_file == "reply.md" and args.text is None
+
+
+def test_send_needs_exactly_one_text_source():
+    with pytest.raises(SystemExit):
+        parse(["send", "--chat", "me"])
+    with pytest.raises(SystemExit):
+        parse(["send", "--chat", "me", "--text", "a", "--text-file", "b"])
+
+
+def test_draft_without_a_chat_lists_drafts():
+    args = parse(["draft"])
+    assert args.chat is None and args.yes is False
+
+
+def test_device_rename_never_reaches_the_network():
+    assert parse(["device", "--name", "Claude"]).offline is True
+
+
+def test_long_running_commands_get_a_cache_of_their_own():
+    assert parse(["mcp"]).cache == "mcp"
+    assert parse(["listen"]).cache == "listen"
+    assert getattr(parse(["chats"]), "cache", None) is None
+
+
+def test_read_can_mark_unread():
+    assert parse(["read", "--chat", "me", "--unread"]).unread is True

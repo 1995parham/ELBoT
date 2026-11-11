@@ -1,6 +1,6 @@
 [project]
 name = "elbot"
-version = "0.2.0"
+version = "0.3.0"
 description = "Parham's Telegram secretary — a user-mode MTProto client"
 readme = "README.md"
 requires-python = ">=3.14"
