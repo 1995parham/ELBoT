@@ -59,6 +59,7 @@ try:
         CreateChannelRequest,
         EditPhotoRequest,
         GetFullChannelRequest,
+        InviteToChannelRequest,
         JoinChannelRequest,
     )
     from telethon.tl.functions.contacts import GetContactsRequest
@@ -68,6 +69,7 @@ try:
     # older telethon had `channels.GetForumTopicsRequest(channel=…)`, and the
     # PEP 723 header requires a version new enough that only the first exists.
     from telethon.tl.functions.messages import (
+        AddChatUserRequest,
         DeleteScheduledMessagesRequest,
         EditChatPhotoRequest,
         GetDialogFiltersRequest,
@@ -2523,6 +2525,60 @@ async def cmd_leave(cli, args) -> None:
     result(args, {**plan, "dry_run": False}, f"left: {label(entity)}")
 
 
+async def cmd_invite(cli, args) -> None:
+    """Add people to a group or channel. Everyone in it sees them arrive."""
+    chat = await resolve(cli, args.chat)
+    if isinstance(chat, User):
+        die("that is a private chat — invite people into a group or channel instead")
+    users = []
+    for ref in args.user:
+        user = await resolve(cli, ref)
+        if not isinstance(user, User):
+            die(f"{ref} is a {kind(user)}, not a person")
+        users.append(user)
+    say(args, f"about to add to {label(chat)} ({kind(chat)}, id={chat.id}):")
+    for u in users:
+        say(args, f"  + {label(u)} (id={u.id})")
+    say(args, "  note   : the members see them join; this needs the right to add members")
+    plan = {"chat": entity_row(chat), "users": [entity_row(u) for u in users]}
+    if not args.yes:
+        dry_run(args, plan, "DRY RUN — nobody added. Re-run with --yes to add them.")
+        return
+    added, missing = [], []
+    try:
+        if isinstance(chat, Chat):  # a basic group adds one person per call
+            for u in users:
+                try:
+                    await cli(AddChatUserRequest(chat_id=chat.id, user_id=u, fwd_limit=100))
+                    added.append(u)
+                except errors.UserAlreadyParticipantError:
+                    say(args, f"  already a member: {label(u)}")
+        else:
+            res = await cli(InviteToChannelRequest(chat, [utils.get_input_user(u) for u in users]))
+            skipped = {getattr(m, "user_id", None) for m in getattr(res, "missing_invitees", None) or []}
+            for u in users:
+                (missing if u.id in skipped else added).append(u)
+    except errors.ChatWriteForbiddenError, errors.ChatAdminRequiredError:
+        die(
+            f"{label(chat)} does not let you add members — ask one of its admins "
+            "(`members --admins`) to add them, or for an invite link they can `join`"
+        )
+    except errors.UserPrivacyRestrictedError:
+        die("their privacy settings block being added — send them an invite link instead")
+    for u in missing:
+        say(args, f"  not added (privacy settings): {label(u)} — send an invite link")
+    result(
+        args,
+        {
+            **plan,
+            "dry_run": False,
+            "added": [entity_row(u) for u in added],
+            "missing": [entity_row(u) for u in missing],
+        },
+        f"added {len(added)} of {len(users)} to {label(chat)}",
+    )
+
+
 # --- people: who is in a group, who someone is, and Parham's own profile -----
 
 
@@ -4155,6 +4211,12 @@ def build_parser() -> argparse.ArgumentParser:
     sp.add_argument("--chat", required=True, help=CHAT_HELP)
     sp.add_argument("--yes", action="store_true", help="actually leave (otherwise dry run)")
     sp.set_defaults(fn=cmd_leave)
+
+    sp = sub.add_parser("invite", help="add people to a group or channel")
+    sp.add_argument("--chat", required=True, help=CHAT_HELP)
+    sp.add_argument("--user", action="append", required=True, help="the person to add, any chat reference; repeatable")
+    sp.add_argument("--yes", action="store_true", help="actually add them (otherwise dry run)")
+    sp.set_defaults(fn=cmd_invite)
 
     sp = sub.add_parser("profile", help="show your profile, or change name, bio or username")
     sp.add_argument("--first", help="first name")
