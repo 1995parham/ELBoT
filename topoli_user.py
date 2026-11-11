@@ -62,7 +62,7 @@ try:
         InviteToChannelRequest,
         JoinChannelRequest,
     )
-    from telethon.tl.functions.contacts import GetContactsRequest
+    from telethon.tl.functions.contacts import DeleteContactsRequest, GetContactsRequest
 
     # Forum topics: the RPC and its parameter name both moved. It is
     # `messages.GetForumTopicsRequest(peer=…)` in the layer this script pins;
@@ -1671,6 +1671,39 @@ async def cmd_contacts(cli, args) -> None:
         phone = f"  +{u.phone}" if getattr(u, "phone", None) else ""
         print(f"{u.id:>16}  {label(u)}{phone}")
     print(f"\n-- {len(hits)} contact(s) of {len(users)}; cache: {INDEX_FILE}", file=sys.stderr)
+
+
+async def cmd_delete_contact(cli, args) -> None:
+    """Remove people from the saved address book.
+
+    Only the contact entry goes: the chat and its history stay, and the person
+    is not told. What they lose is what a contact gets, such as a phone number
+    shown under the "My Contacts" privacy rule. It is still a write with no undo
+    here (adding someone back needs their number), so it is a dry run until
+    --yes, and anyone who is not a saved contact is refused rather than skipped.
+    """
+    res = await cli(GetContactsRequest(hash=0))
+    saved = {u.id: u for u in getattr(res, "users", [])}
+    people = []
+    for ref in args.user:
+        entity = await resolve(cli, ref)
+        if not isinstance(entity, User):
+            die(f"{ref} is {kind(entity)} {label(entity)!r}, not a person")
+        if entity.id not in saved:
+            die(f"{label(entity)} (id={entity.id}) is not a saved contact")
+        if entity.id not in {p.id for p in people}:
+            people.append(saved[entity.id])
+    rows = [{**entity_row(u), "phone": getattr(u, "phone", None)} for u in people]
+    for u in people:
+        phone = f" +{u.phone}" if getattr(u, "phone", None) else ""
+        say(args, f"about to delete contact: {label(u)}{phone} (id={u.id})")
+    say(args, "  note   : the chat and its history stay; they are not notified")
+    plan = {"action": "delete-contact", "contacts": rows}
+    if not args.yes:
+        dry_run(args, plan, "DRY RUN — no contact deleted. Re-run with --yes to delete.")
+        return
+    await cli(DeleteContactsRequest(id=people))
+    result(args, {**plan, "dry_run": False}, f"deleted {len(people)} contact(s)")
 
 
 async def cmd_catchup(cli, args) -> None:
@@ -3971,6 +4004,11 @@ def build_parser() -> argparse.ArgumentParser:
     sp = add_json(sub.add_parser("contacts", help="the saved address book — far faster than scanning chats"))
     sp.add_argument("--query", help="filter by name or username")
     sp.set_defaults(fn=cmd_contacts)
+
+    sp = sub.add_parser("delete-contact", help="remove people from the saved address book; their chats stay")
+    sp.add_argument("--user", action="append", required=True, help="@username, id, alias or name; repeat for several")
+    sp.add_argument("--yes", action="store_true", help="actually delete (otherwise dry run)")
+    sp.set_defaults(fn=cmd_delete_contact)
 
     sp = add_json(sub.add_parser("catchup", help="everything unread, exactly as much as is unread"))
     sp.add_argument("--limit", type=int, default=100, help="how many chats to scan")
