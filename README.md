@@ -2,6 +2,8 @@
 
 A personal Telegram secretary that logs in as the account itself over MTProto (via [Telethon](https://codeberg.org/Lonami/Telethon)) — so it can read any chat backwards, search the whole archive, see every group and channel, send as the user with full markdown/HTML/quote formatting, upload files, react, mark chats read, and manage folders.
 
+It is built to be driven by an AI agent as much as by a person: every command is also an [MCP](https://modelcontextprotocol.io) tool (`mcp`), every command answers in JSON (`--json`), every write is a dry run until it is confirmed, and the session announces itself to Telegram under a name you choose, so it shows up in Settings → Devices as what it is — the AI secretary — rather than as a stray laptop.
+
 ## Running
 
 `topoli_user.py` declares its dependencies inline (PEP 723), so [uv](https://docs.astral.sh/uv/) runs it with no venv to manage:
@@ -15,6 +17,58 @@ uv run topoli_user.py search --query "invoice" --since 2026-01-01
 uv run topoli_user.py send --chat wife --text "**hello**"
 uv run topoli_user.py send --chat "Some Group" --quote --text "$(cat note.txt)"
 ```
+
+### Commands at a glance
+
+| Area | Commands |
+| --- | --- |
+| Reading | `catchup`, `mentions`, `chats`, `contacts`, `history`, `get`, `search`, `topics`, `members`, `info`, `transcribe`, `download`, `export`, `listen` |
+| Writing as you (dry run until `--yes`) | `send`, `send-file`, `poll`, `edit`, `delete`, `forward`, `react`, `pin` |
+| Writing only you see | `draft`, `read` (`--unread`), `mute`, `archive`, `folder`, `folders`, `tags`, `alias` |
+| Groups and profile | `create-group`, `chat-photo`, `join`, `leave`, `profile` |
+| The session | `accounts`, `whoami`, `device`, `sessions`, `setup`, `login` |
+| AI interface | `mcp`, `schema` |
+
+### For AI agents: MCP, JSON and dry runs
+
+`mcp` serves every command as a tool over the Model Context Protocol on stdio. The tool list is generated from the argument parser, so each flag is a typed parameter and nothing is described twice:
+
+```bash
+claude mcp add elbot -- uv run /path/to/topoli_user.py mcp                       # Claude Code
+claude mcp add elbot-work -- uv run /path/to/topoli_user.py --account work mcp   # a second account
+```
+
+One connection stays open for the whole session, so a tool call is one round trip to Telegram rather than a fresh handshake. The server hands the agent its rules in the MCP `instructions`: call a write without `yes` first, show the person the recipient and the text, and only then call it again with `yes: true` — or, when a reply has not been approved, put it in the chat's input box with `draft` for the person to send themselves.
+
+`schema` prints the same tool list for frameworks that are not MCP: `--format openai` for OpenAI-style function definitions, `--format anthropic` for the Messages API `tools` array.
+
+Every command takes `--json`. A read prints its rows; a write prints its plan (`"dry_run": true`) or its outcome (the new `message_id`), and the human narration moves to stderr so stdout is exactly one JSON document. Errors under `--json` are `{"error": "…"}`. Messages in JSON carry `reply_to`, `topic_id`, `forwarded`, `edited` and a `media` object (type, file name, MIME type, size, duration), so an agent can tell a 12-second voice note worth `transcribe` from a 40 MB PDF without downloading either. `--text-file` (or `--text-file -` for stdin) passes a message without shell quoting, which matters for text full of backticks, `$` and Persian.
+
+`listen` looks forward instead of back: it prints each new message as it arrives (one JSON object per line under `--json`) and stops after `--count` messages or `--timeout` seconds — the way for an agent to wait for the answer to a question it just asked. Under `mcp` it never waits longer than a minute unless told to.
+
+### The device name
+
+Every connection tells Telegram a device model, a system version and an app version, and Telegram shows them for the session under Settings → Devices, which is also where the account owner terminates a session they do not recognise. ELBoT announces itself as `ELBoT`; name it whatever should be recognisable:
+
+```bash
+uv run topoli_user.py device --name "Claude" --system "AI secretary"   # stored beside the script
+uv run topoli_user.py sessions                                         # every logged-in device; * is this one
+uv run topoli_user.py sessions --terminate <hash> --yes                # log a device out
+```
+
+The name goes out with the next connection, which is when Telegram records it, so `sessions` on the next run shows it. `TOPOLI_DEVICE_MODEL`, `TOPOLI_SYSTEM_VERSION` and `TOPOLI_APP_VERSION` override the stored values.
+
+### Several accounts
+
+`--account NAME` (or `TOPOLI_ACCOUNT=NAME`) picks which login to act as. Each account is `<name>.authkey` beside the script, with its own cache, title index and pending login in the state dir; the default account is `topoli`, which is the layout from before accounts existed. `accounts` lists them.
+
+```bash
+uv run topoli_user.py --account work login --phone +34XXXXXXXXX
+uv run topoli_user.py --account work login --code 12345 [--password <2fa>]
+uv run topoli_user.py --account work catchup
+```
+
+Long-running processes (`mcp`, `listen`) keep a cache of their own and lock it, so they never collide with a one-off command or with each other on "database is locked"; a second server on the same account falls back to a private cache that is deleted when it exits.
 
 ### Finding the right chat
 
@@ -32,11 +86,15 @@ An alias exists for the case the others cannot settle: "wife" is not a Telegram 
 
 A group's own photo is not a message, so `download` cannot reach it — `chat-photo` does. With only `--chat` it reports whether there is one and `--out DIR` saves it; `--set FILE` replaces it and `--remove` clears it, both dry runs until `--yes`. Save the current one before replacing it: everyone in the chat sees the change and Telegram offers no undo. Note a basic group and a supergroup take different RPCs behind this (`messages.EditChatPhoto` against a `Chat`, `channels.EditPhoto` against a `Channel`), which the tool picks for you — sending the wrong one fails as a type error that reads like a broken tool rather than a wrong call.
 
-Every read command takes `--json` for machine-readable output.
+Every command takes `--json` for machine-readable output.
+
+`mentions` reads only the unread messages that name you or reply to you, across every chat — in a busy group that is the one message out of two hundred that matters. `get --chat X --message N --context 3` reads exactly where a reply or a search hit points, with the messages around it. `info` shows a person's bio, phone, last-seen and the number of groups you share, or a group's description and member count; `members` lists a group with roles. `transcribe` turns a voice or video note into text with Telegram's own recogniser (Premium). `export` saves a whole conversation to JSON Lines or Markdown, with `--media DIR` to keep the files.
 
 ### Writing
 
 `send`, `edit` and the `send-file` caption honour `--parse {markdown,html,none}`. Markdown is Telegram Desktop's dialect: `**bold**`, `__italic__`, `~~strike~~`, `||spoiler||`, `` `code` ``, a ```` ```lang ```` fence for a highlighted block, `[label](url)`, and `>`-prefixed lines as a blockquote. HTML adds `<u>` underline, `<tg-spoiler>` and `<blockquote expandable>`. Single `*` and `_` are *not* markup, so `__init__` and `a || b` outside backticks are eaten — use `--parse none` for text full of them. `--quote` / `--expandable` wrap the whole message in a blockquote in any mode. `--schedule 2026-09-01T09:00` hands delivery to Telegram rather than keeping a process alive.
+
+`draft` writes a reply into a chat's input box on every device you are logged in to, for you to read and send yourself; nobody else sees it, and `draft` with no `--chat` lists the drafts waiting. `send` also takes `--silent` (no notification sound) and `--no-preview`; `poll` sends a poll or, with `--quiz N`, a quiz. `pin`, `mute --for 8h`, `archive`, `join` and `leave` cover the rest of a chat's housekeeping, and `profile` shows or changes your name, bio and username.
 
 Every write is a **dry run** until you add `--yes`; it prints the resolved recipient and the exact text first. `edit`, `delete` and `forward` follow the same rule — `delete` removes for everyone by default, and `--only-me` clears just your own view.
 
