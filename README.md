@@ -1,12 +1,32 @@
-# elbot
+# ELBoT
 
 A personal Telegram secretary that logs in as the account itself over MTProto (via [Telethon](https://codeberg.org/Lonami/Telethon)) — so it can read any chat backwards, search the whole archive, see every group and channel, send as the user with full markdown/HTML/quote formatting, upload files, react, mark chats read, and manage folders.
 
 It is built to be driven by an AI agent as much as by a person: every command is also an [MCP](https://modelcontextprotocol.io) tool (`mcp`), every command answers in JSON (`--json`), every write is a dry run until it is confirmed, and the session announces itself to Telegram under a name you choose, so it shows up in Settings → Devices as what it is — the AI secretary — rather than as a stray laptop.
 
-## Running
+## Getting started
 
-`topoli_user.py` declares its dependencies inline (PEP 723), so [uv](https://docs.astral.sh/uv/) runs it with no venv to manage:
+`topoli_user.py` is one file that declares its dependencies inline (PEP 723), so [uv](https://docs.astral.sh/uv/) runs it with no venv to manage. It needs Python 3.14, which uv fetches on its own.
+
+1. Create an app at <https://my.telegram.org> → API development tools, and store its id and hash:
+
+    ```bash
+    uv run topoli_user.py setup --api-id 123456 --api-hash 0123456789abcdef0123456789abcdef --phone +34XXXXXXXXX
+    ```
+
+2. Log in. Telegram sends the code to your other devices (or by SMS/email); the code and the 2FA password are two separate steps, so it works without a terminal prompt:
+
+    ```bash
+    uv run topoli_user.py login                       # sends the code
+    uv run topoli_user.py login --code 12345          # add --password … if the account has 2FA
+    uv run topoli_user.py whoami
+    ```
+
+3. Where Telegram is blocked, point it at a proxy: `TOPOLI_PROXY=socks5://127.0.0.1:1080` (or `http://…`). Telethon ignores the usual proxy variables, so ELBoT reads `TOPOLI_PROXY` first and falls back to `all_proxy`, `https_proxy` and `http_proxy`.
+
+The login leaves `topoli.authkey` beside the script — the whole account in one line; see [Credentials](#credentials--never-in-this-repo). Caches go to `~/.local/state/automated-topoli/` (`TOPOLI_STATE_DIR` moves them).
+
+## Running
 
 ```bash
 uv run topoli_user.py catchup                                   # everything unread
@@ -77,7 +97,16 @@ uv run topoli_user.py watch --dry --timeout 600      # match and print, act on n
 uv run topoli_user.py --account work watch           # for real; run it under systemd or launchd
 ```
 
-Writing a rule is the authorisation for its actions, so a rule that reacts or forwards does it unattended — read `--check` before leaving it running.
+Writing a rule is the authorisation for its actions, so a rule that reacts or forwards does it unattended — read `--check` before leaving it running. To keep it running, give it a service of its own, one per account, for example a systemd user unit:
+
+```ini
+[Service]
+ExecStart=%h/.local/bin/uv run --quiet /path/to/topoli_user.py --account work watch
+Restart=on-failure
+RestartSec=30
+```
+
+or a launchd agent with the same command and `KeepAlive` on macOS.
 
 ### The device name
 
@@ -121,8 +150,6 @@ An alias exists for the case the others cannot settle: "wife" is not a Telegram 
 
 A group's own photo is not a message, so `download` cannot reach it — `chat-photo` does. With only `--chat` it reports whether there is one and `--out DIR` saves it; `--set FILE` replaces it and `--remove` clears it, both dry runs until `--yes`. Save the current one before replacing it: everyone in the chat sees the change and Telegram offers no undo. Note a basic group and a supergroup take different RPCs behind this (`messages.EditChatPhoto` against a `Chat`, `channels.EditPhoto` against a `Channel`), which the tool picks for you — sending the wrong one fails as a type error that reads like a broken tool rather than a wrong call.
 
-Every command takes `--json` for machine-readable output.
-
 `mentions` reads only the unread messages that name you or reply to you, across every chat — in a busy group that is the one message out of two hundred that matters. `get --chat X --message N --context 3` reads exactly where a reply or a search hit points, with the messages around it. `info` shows a person's bio, phone, last-seen and the number of groups you share, or a group's description and member count; `members` lists a group with roles. `transcribe` turns a voice or video note into text with Telegram's own recogniser (Premium). `export` saves a whole conversation to JSON Lines or Markdown, with `--media DIR` to keep the files.
 
 ### Writing
@@ -137,20 +164,22 @@ Every write is a **dry run** until you add `--yes`; it prints the resolved recip
 
 This repository is public and holds **code only**. Every credential lives outside it and is loaded at runtime:
 
-- `TOPOLI_SESSION_STRING` (or a local `*.authkey`) — the Telethon session. This is a full-account bearer credential: whoever holds it is logged in as the user, with no 2FA re-prompt.
-- `api.json` / `TOPOLI_API_ID` + `TOPOLI_API_HASH` — the app credentials from <https://my.telegram.org>.
+- `<account>.authkey` (or `TOPOLI_SESSION_STRING` for the default account) — the Telethon session. This is a full-account bearer credential: whoever holds it is logged in as the user, with no 2FA re-prompt. Revoke it from Telegram → Settings → Devices, or with `sessions --terminate`.
+- `api.json`, `api-<account>.json` / `TOPOLI_API_ID` + `TOPOLI_API_HASH` — the app credentials from <https://my.telegram.org>, phones and device names.
+- `aliases*.json`, `tags*.json`, `watch.json` — not secrets, but they name the real people you talk to.
 
-`.gitignore` blocks `api.json`, `token`, `*.authkey`, and `*.session` so none of them can be committed by accident. Keep them in a private store.
+`.gitignore` blocks all of them, and the `*.session` caches, so none can be committed by accident. Keep them in a private repository beside the script: copy the code in from here (`git ls-files` lists exactly what to copy), never the other way.
 
 ## Development
 
 ```bash
-uv sync            # create the environment from pyproject
+uv sync                    # create the environment from pyproject
 uv run ruff check .
+uv run ruff format --check .
 uv run ty check .
 uv run pytest
 ```
 
-`ruff` lints, `ty` type-checks, and `pytest` covers the pure helpers — message formatting (UTF-16 entity offsets, which fail silently across emoji and Persian), chat resolution, the alias book, date parsing and proxy handling. All three run in CI on every push and pull request. The project targets Python 3.14, so it leans on what that release added — annotations are lazy by default (PEP 649), and `except` takes an unparenthesised list of exception types (PEP 758).
+`ruff` lints and checks formatting, `ty` type-checks, and `pytest` needs no network: it covers the code whose bugs would be silent or would reach the wrong person — message formatting (UTF-16 entity offsets, which fail silently across emoji and Persian), chat resolution and the alias book, account selection and key isolation, the MCP tool schema and the JSON-RPC round trip, prompts and resources, the watcher's rule matching, tags, durations and polls. All of it runs in CI on every push and pull request. The project targets Python 3.14, so it leans on what that release added — annotations are lazy by default (PEP 649), and `except` takes an unparenthesised list of exception types (PEP 758).
 
 Telethon's development moved off GitHub in February 2026: <https://github.com/LonamiWebs/Telethon> is archived and read-only, and the live repository is now <https://codeberg.org/Lonami/Telethon>. The PyPI package name is unchanged, so nothing here depends on the move beyond the link.

@@ -1,11 +1,16 @@
-# --- credentials: never commit these; they live in the private keys repo ---
+# --- credentials and private data: never commit these; they live in a private repo ---
 api.json
+api-*.json
 token
-# not a credential, but it maps names to the real people you talk to
-aliases.json
 *.authkey
 *.session
 *.session-journal
+# not credentials, but they name the real people you talk to
+aliases.json
+aliases-*.json
+tags.json
+tags-*.json
+watch.json
 
 # --- python ---
 __pycache__/
@@ -20,5 +25,3 @@ uv.lock
 .ty_cache/
 .mypy_cache/
 .pytest_cache/
-tags.json
-watch.json
