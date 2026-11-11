@@ -123,6 +123,7 @@ STATE_DIR = Path(os.environ.get("TOPOLI_STATE_DIR", Path.home() / ".local/state/
 # anyone in without the phone, the code and the 2FA password, so they live in
 # the repo and travel to every machine.
 REPO_CONFIG = SKILL_DIR / "api.json"
+ACCOUNT_CONFIG = SKILL_DIR / "api-topoli.json"  # re-pointed by set_account
 CONFIG_FILE = STATE_DIR / "user.json"
 INDEX_FILE = STATE_DIR / "chat-index.json"  # cached title->id map for fast resolve
 PENDING = STATE_DIR / "login-pending.json"
@@ -163,29 +164,53 @@ SESSION_STRING = SKILL_DIR / "topoli.authkey"
 # account is just a name: `<name>.authkey` beside the script is its login,
 # `<name>.session` in the state dir its cache, and the title index and the
 # pending-login file are kept per name too, because a chat id one account can
-# reach the other may not. The default account is `topoli`, which is exactly the
-# layout from before accounts existed, so nothing already set up moves.
+# reach the other may not.
+#
+# Which account runs without --account is `"account"` in api.json (then the
+# TOPOLI_ACCOUNT environment variable, which wins). With neither it is
+# `topoli`, the layout from before accounts existed, whose cache, index and
+# pending login keep their old unsuffixed names so nothing already set up moves.
+#
+# An account may also carry files of its own beside the shared ones:
+# `api-<name>.json` is merged over api.json (its phone, a device name of its
+# own), and `aliases-<name>.json` / `tags-<name>.json`, when they exist,
+# *replace* the shared books for that account. A support account that talks to
+# clients must never resolve "wife" to somebody, so it gets a book of its own.
 
-DEFAULT_ACCOUNT = "topoli"
-ACCOUNT = DEFAULT_ACCOUNT
+LEGACY_ACCOUNT = "topoli"
+ACCOUNT = LEGACY_ACCOUNT
 _ACCOUNT_NAME = re.compile(r"[a-z0-9][a-z0-9_-]{0,31}")
+
+
+def default_account() -> str:
+    """The account used when none is named: env, then api.json, then `topoli`."""
+    named = os.environ.get("TOPOLI_ACCOUNT") or read_json(SKILL_DIR / "api.json").get("account")
+    return str(named or LEGACY_ACCOUNT).strip().lower()
+
+
+def own_or_shared(stem: str, suffix: str = ".json") -> Path:
+    """`<stem>-<account>.json` when this account has one, else the shared `<stem>.json`."""
+    own = SKILL_DIR / f"{stem}-{ACCOUNT}{suffix}"
+    return own if own.is_file() else SKILL_DIR / f"{stem}{suffix}"
 
 
 def set_account(name: str | None) -> None:
     """Point every per-account path at `name` (None: the default account)."""
-    global ACCOUNT, SESSION, SESSION_STRING, INDEX_FILE, PENDING
-    name = (name or DEFAULT_ACCOUNT).strip().lower()
+    global ACCOUNT, SESSION, SESSION_STRING, INDEX_FILE, PENDING, ALIAS_REPO, TAGS_FILE, ACCOUNT_CONFIG
+    name = (name or default_account()).strip().lower()
     if not _ACCOUNT_NAME.fullmatch(name):
         die(f"account names are lowercase letters, digits, - and _, got {name!r}")
     ACCOUNT = name
-    if name == DEFAULT_ACCOUNT:
+    ACCOUNT_CONFIG = SKILL_DIR / f"api-{name}.json"
+    ALIAS_REPO = own_or_shared("aliases")
+    TAGS_FILE = own_or_shared("tags")
+    SESSION_STRING = SKILL_DIR / f"{name}.authkey"
+    if name == LEGACY_ACCOUNT:
         SESSION = Path(os.environ.get("TOPOLI_SESSION", STATE_DIR / "topoli.session"))
-        SESSION_STRING = SKILL_DIR / "topoli.authkey"
         INDEX_FILE = STATE_DIR / "chat-index.json"
         PENDING = STATE_DIR / "login-pending.json"
         return
     SESSION = Path(os.environ.get("TOPOLI_SESSION", STATE_DIR / f"{name}.session"))
-    SESSION_STRING = SKILL_DIR / f"{name}.authkey"
     INDEX_FILE = STATE_DIR / f"chat-index-{name}.json"
     PENDING = STATE_DIR / f"login-pending-{name}.json"
 
@@ -193,10 +218,10 @@ def set_account(name: str | None) -> None:
 def invocation() -> str:
     """How to re-run this tool for the current account, for printed hints."""
     base = "uv run topoli_user.py"
-    return base if ACCOUNT == DEFAULT_ACCOUNT else f"{base} --account {ACCOUNT}"
+    return base if default_account() == ACCOUNT else f"{base} --account {ACCOUNT}"
 
 
-VERSION = "0.4.0"
+VERSION = "0.5.0"
 
 #: Set while a command runs with --json, so `die` can answer in the same
 #: format: a caller parsing stdout must get an object, not an empty string.
@@ -223,10 +248,11 @@ def die(msg: str) -> NoReturn:
 def load_config() -> dict:
     """Merge the repo defaults with any machine-local override."""
     cfg: dict = {}
-    for path in (REPO_CONFIG, CONFIG_FILE):  # later wins
+    for path in (REPO_CONFIG, ACCOUNT_CONFIG, CONFIG_FILE):  # later wins
         if path.is_file():
             with contextlib.suppress(json.JSONDecodeError):
                 cfg.update(json.loads(path.read_text()))
+    cfg.pop("account", None)  # which account is the default is not a setting of this one
     return cfg
 
 
@@ -292,8 +318,13 @@ def proxy() -> tuple[str, str, int] | None:
 
 
 def session_string() -> tuple[str, str] | None:
-    """The stored auth key, unless the environment overrides it."""
-    raw = os.environ.get("TOPOLI_SESSION_STRING")
+    """The stored auth key, unless the environment overrides it.
+
+    The override applies to the default account only. Otherwise a key exported
+    for one account would quietly log `--account raha` in as somebody else, and
+    every message "from support" would go out under that person's name.
+    """
+    raw = os.environ.get("TOPOLI_SESSION_STRING") if default_account() == ACCOUNT else None
     source = "TOPOLI_SESSION_STRING"
     if raw is None and SESSION_STRING.is_file():
         raw, source = SESSION_STRING.read_text(), str(SESSION_STRING)
@@ -1051,9 +1082,12 @@ async def cmd_login(cli, args) -> None:
         print("treat it as a password: it logs anyone holding it in as you, with no 2FA")
         return
 
-    # The phone in api.json belongs to the default account; another account
-    # must name its own, or a login meant for it would go to the wrong number.
-    phone = args.phone or (load_config().get("phone") if ACCOUNT == DEFAULT_ACCOUNT else None)
+    # A phone in api-<account>.json is that account's. The one in the shared
+    # api.json belongs to the default account; any other account must name its
+    # own, or a login meant for it would go to the wrong number.
+    own = read_json(ACCOUNT_CONFIG).get("phone")
+    shared = read_json(REPO_CONFIG).get("phone") if default_account() == ACCOUNT else None
+    phone = args.phone or own or shared
     if phone and not args.code:
         sent = await cli.send_code_request(phone)
         STATE_DIR.mkdir(parents=True, exist_ok=True)
@@ -2069,7 +2103,7 @@ async def cmd_accounts(cli, args) -> None:  # never reaches the network
     rows = [
         {
             "account": key.stem,
-            "default": key.stem == DEFAULT_ACCOUNT,
+            "default": key.stem == default_account(),
             "selected": key.stem == ACCOUNT,
             "authkey": str(key),
         }
@@ -2093,7 +2127,7 @@ async def cmd_device(cli, args) -> None:
     is offline, and `sessions` on the next run is how to see it took.
     """
     if args.name or args.system or args.app or args.reset:
-        target = CONFIG_FILE if args.local else REPO_CONFIG
+        target = CONFIG_FILE if args.local else ACCOUNT_CONFIG if args.this_account else REPO_CONFIG
         if args.local:
             STATE_DIR.mkdir(parents=True, exist_ok=True)
         cfg = read_json(target)
@@ -3853,7 +3887,7 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument(
         "--account",
         default=os.environ.get("TOPOLI_ACCOUNT"),
-        help=f"which login to act as: <name>.authkey beside the script (default: {DEFAULT_ACCOUNT}, or TOPOLI_ACCOUNT)",
+        help='which login to act as: <name>.authkey beside the script (default: "account" in api.json)',
     )
     p.add_argument("--version", action="version", version=f"elbot {VERSION}")
     sub = p.add_subparsers(dest="cmd", required=True)
@@ -4026,6 +4060,7 @@ def build_parser() -> argparse.ArgumentParser:
     sp.add_argument("--app", help='the app line, e.g. "ELBoT 0.3"')
     sp.add_argument("--reset", action="store_true", help="forget the stored identity and use the default")
     sp.add_argument("--local", action="store_true", help="store on this machine only, not beside the script")
+    sp.add_argument("--this-account", action="store_true", help="store in api-<account>.json, for this account only")
     sp.set_defaults(fn=cmd_device, offline=True)
 
     sp = sub.add_parser("sessions", help="every device logged in to the account; log one out")

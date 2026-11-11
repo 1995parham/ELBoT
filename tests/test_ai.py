@@ -274,8 +274,10 @@ class TestAccounts:
         monkeypatch.setattr(t, "SKILL_DIR", tmp_path)
         monkeypatch.setattr(t, "STATE_DIR", tmp_path / "state")
         monkeypatch.delenv("TOPOLI_SESSION", raising=False)
+        monkeypatch.delenv("TOPOLI_ACCOUNT", raising=False)
+        monkeypatch.delenv("TOPOLI_SESSION_STRING", raising=False)
         yield
-        t.set_account(None)
+        t.set_account(t.LEGACY_ACCOUNT)
 
     def test_the_default_keeps_the_old_layout(self, tmp_path):
         t.set_account(None)
@@ -295,10 +297,65 @@ class TestAccounts:
     def test_names_cannot_escape_the_directory(self, name):
         if not name:
             t.set_account(name)  # empty means the default
-            assert t.ACCOUNT == t.DEFAULT_ACCOUNT
+            assert t.ACCOUNT == t.LEGACY_ACCOUNT
             return
         with pytest.raises(SystemExit):
             t.set_account(name)
 
     def test_the_flag_comes_before_the_command(self):
         assert t.build_parser().parse_args(["--account", "parham", "whoami"]).account == "parham"
+
+
+class TestThreeAccounts:
+    """spain is the default, iran and raha are named; raha keeps its own books."""
+
+    @pytest.fixture(autouse=True)
+    def _vault(self, monkeypatch, tmp_path):
+        monkeypatch.setattr(t, "SKILL_DIR", tmp_path)
+        monkeypatch.setattr(t, "REPO_CONFIG", tmp_path / "api.json")
+        monkeypatch.setattr(t, "STATE_DIR", tmp_path / "state")
+        monkeypatch.setattr(t, "CONFIG_FILE", tmp_path / "state" / "user.json")
+        for var in ("TOPOLI_SESSION", "TOPOLI_ACCOUNT", "TOPOLI_SESSION_STRING"):
+            monkeypatch.delenv(var, raising=False)
+        (tmp_path / "api.json").write_text(
+            json.dumps({"api_id": 1, "api_hash": "h", "phone": "+34", "account": "spain"})
+        )
+        (tmp_path / "api-raha.json").write_text(json.dumps({"phone": "+98912"}))
+        (tmp_path / "aliases.json").write_text(json.dumps({"wife": 1}))
+        (tmp_path / "aliases-raha.json").write_text(json.dumps({"acme": 2}))
+        yield tmp_path
+        t.set_account(t.LEGACY_ACCOUNT)
+
+    def test_api_json_names_the_default(self):
+        t.set_account(None)
+        assert t.ACCOUNT == "spain" and t.SESSION_STRING.name == "spain.authkey"
+
+    def test_the_environment_wins(self, monkeypatch):
+        monkeypatch.setenv("TOPOLI_ACCOUNT", "iran")
+        t.set_account(None)
+        assert t.ACCOUNT == "iran"
+
+    def test_raha_gets_its_own_alias_book_and_never_the_personal_one(self):
+        t.set_account("raha")
+        assert set(t.load_aliases()) == {"acme"}
+        t.set_account("iran")
+        assert set(t.load_aliases()) == {"wife"}
+
+    def test_an_accounts_own_config_is_merged_over_the_shared_one(self):
+        t.set_account("raha")
+        cfg = t.load_config()
+        assert cfg["phone"] == "+98912" and cfg["api_id"] == 1 and "account" not in cfg
+
+    def test_the_env_key_never_reaches_a_named_account(self, monkeypatch):
+        monkeypatch.setenv("TOPOLI_SESSION_STRING", "someone-elses-key")
+        t.set_account("raha")
+        assert t.session_string() is None
+        t.set_account(None)
+        found = t.session_string()
+        assert found is not None and found[1] == "TOPOLI_SESSION_STRING"
+
+    def test_hints_name_the_account_unless_it_is_the_default(self):
+        t.set_account("spain")
+        assert "--account" not in t.invocation()
+        t.set_account("raha")
+        assert "--account raha" in t.invocation()

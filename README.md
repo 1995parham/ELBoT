@@ -93,13 +93,15 @@ The name goes out with the next connection, which is when Telegram records it, s
 
 ### Several accounts
 
-`--account NAME` (or `TOPOLI_ACCOUNT=NAME`) picks which login to act as. Each account is `<name>.authkey` beside the script, with its own cache, title index and pending login in the state dir; the default account is `topoli`, which is the layout from before accounts existed. `accounts` lists them.
+`--account NAME` (or `TOPOLI_ACCOUNT=NAME`) picks which login to act as. Each account is `<name>.authkey` beside the script, with its own cache, title index and pending login in the state dir; `accounts` lists them. The one used without `--account` is `"account"` in `api.json`, or `topoli` — the layout from before accounts existed — when it names none.
 
 ```bash
 uv run topoli_user.py --account work login --phone +34XXXXXXXXX
 uv run topoli_user.py --account work login --code 12345 [--password <2fa>]
 uv run topoli_user.py --account work catchup
 ```
+
+An account can carry files of its own next to the shared ones: `api-<name>.json` is merged over `api.json` (its phone, or a device name of its own with `device --this-account`), and `aliases-<name>.json` and `tags-<name>.json` *replace* the shared books for that account — the way to keep a support account that talks to clients from ever resolving a personal alias. `TOPOLI_SESSION_STRING` applies to the default account only, so an exported key can never log another account in as the wrong person.
 
 Long-running processes (`mcp`, `listen`) keep a cache of their own and lock it, so they never collide with a one-off command or with each other on "database is locked"; a second server on the same account falls back to a private cache that is deleted when it exits.
 
