@@ -38,4 +38,4 @@ python-version = "3.14"
 
 [tool.ty.rules]
 # telethon ships no type information; silence unresolved-attribute noise from it
-unresolved-attribute = "ignore"
+missing-attribute = "ignore"

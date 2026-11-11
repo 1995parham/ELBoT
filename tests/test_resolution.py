@@ -112,14 +112,17 @@ class TestParseWhen:
         assert t.parse_when(None, "--since") is None
 
     def test_a_bare_date_is_accepted(self):
-        assert t.parse_when("2026-08-01", "--since").year == 2026
+        when = t.parse_when("2026-08-01", "--since")
+        assert when is not None and when.year == 2026
 
     def test_the_result_is_always_tz_aware(self):
         # A naive value would compare-explode against Telegram's aware dates.
-        assert t.parse_when("2026-08-01T14:30", "--since").tzinfo is not None
+        when = t.parse_when("2026-08-01T14:30", "--since")
+        assert when is not None and when.tzinfo is not None
 
     def test_an_explicit_offset_is_honoured(self):
-        assert t.parse_when("2026-08-01T00:00+00:00", "--until").hour == 0
+        when = t.parse_when("2026-08-01T00:00+00:00", "--until")
+        assert when is not None and when.hour == 0
 
     def test_garbage_exits_with_a_message(self):
         with pytest.raises(SystemExit):
