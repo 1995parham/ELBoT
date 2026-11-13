@@ -28,6 +28,7 @@ WRITES = [
     "invite",
     "delete-contact",
     "profile",
+    "privacy",
     "poll",
     "sessions",
     "scheduled",

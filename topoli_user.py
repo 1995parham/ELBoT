@@ -49,8 +49,15 @@ try:
     from telethon.helpers import add_surrogate, del_surrogate, strip_text
     from telethon.sessions import SQLiteSession, StringSession
     from telethon.tl.functions.account import (
+        GetAccountTTLRequest,
         GetAuthorizationsRequest,
+        GetGlobalPrivacySettingsRequest,
+        GetPrivacyRequest,
         ResetAuthorizationRequest,
+        SetAccountTTLRequest,
+        SetGlobalPrivacySettingsRequest,
+        SetPrivacyRequest,
+        UpdateBirthdayRequest,
         UpdateNotifySettingsRequest,
         UpdateProfileRequest,
         UpdateUsernameRequest,
@@ -89,8 +96,11 @@ try:
         TranscribeAudioRequest,
         UpdateDialogFilterRequest,
     )
+    from telethon.tl.functions.photos import DeletePhotosRequest, GetUserPhotosRequest, UploadProfilePhotoRequest
     from telethon.tl.functions.users import GetFullUserRequest
     from telethon.tl.types import (
+        AccountDaysTTL,
+        Birthday,
         Channel,
         ChannelParticipantsAdmins,
         Chat,
@@ -101,6 +111,27 @@ try:
         InputMediaPoll,
         InputNotifyPeer,
         InputPeerNotifySettings,
+        InputPhoto,
+        InputPrivacyKeyAbout,
+        InputPrivacyKeyAddedByPhone,
+        InputPrivacyKeyBirthday,
+        InputPrivacyKeyChatInvite,
+        InputPrivacyKeyForwards,
+        InputPrivacyKeyPhoneCall,
+        InputPrivacyKeyPhoneNumber,
+        InputPrivacyKeyPhoneP2P,
+        InputPrivacyKeyProfilePhoto,
+        InputPrivacyKeySavedMusic,
+        InputPrivacyKeyStarGiftsAutoSave,
+        InputPrivacyKeyStatusTimestamp,
+        InputPrivacyKeyVoiceMessages,
+        InputPrivacyValueAllowAll,
+        InputPrivacyValueAllowChatParticipants,
+        InputPrivacyValueAllowContacts,
+        InputPrivacyValueAllowUsers,
+        InputPrivacyValueDisallowAll,
+        InputPrivacyValueDisallowChatParticipants,
+        InputPrivacyValueDisallowUsers,
         InputReplyToMessage,
         MessageEntityBlockquote,
         MessageEntityCode,
@@ -1467,7 +1498,8 @@ def photo_request(entity, photo):
 
     A `User` has no chat photo to edit. Changing your *own* avatar is
     `photos.UploadProfilePhoto`, a different thing with a much wider blast
-    radius, so this refuses rather than quietly doing it.
+    radius, so this refuses rather than quietly doing it: that is
+    `profile --photo`, which says so in its own preview.
     """
     if isinstance(entity, Chat):
         return EditChatPhotoRequest(chat_id=entity.id, photo=photo)
@@ -2719,13 +2751,27 @@ async def cmd_info(cli, args) -> None:
 
 
 async def cmd_profile(cli, args) -> None:
-    """Show Parham's own profile, or change his name, bio or username.
+    """Show Parham's own profile, or change his name, bio, username, birthday or photo.
 
-    Every contact sees the change, so writes are a dry run until --yes.
+    Every contact sees the change, so writes are a dry run until --yes. A new
+    --photo goes on top and the old ones stay in the profile's history;
+    --remove-photo deletes only the current one, so the previous photo comes
+    back. --photo-out saves the current photo, which is the only undo there is.
     """
+    if args.photo and args.remove_photo:
+        die("--photo sets a new photo and --remove-photo deletes the current one; pick one")
     me = await cli.get_me()
     full = (await cli(GetFullUserRequest(me))).full_user
-    now = {"first_name": me.first_name, "last_name": me.last_name, "bio": full.about, "username": me.username}
+    photos = await cli(GetUserPhotosRequest(user_id=me, offset=0, max_id=0, limit=1))
+    count = getattr(photos, "count", len(photos.photos))
+    now = {
+        "first_name": me.first_name,
+        "last_name": me.last_name,
+        "bio": full.about,
+        "username": me.username,
+        "birthday": birthday_text(full.birthday),
+        "photos": count,
+    }
     wanted = {
         k: v
         for k, v in (
@@ -2736,12 +2782,40 @@ async def cmd_profile(cli, args) -> None:
         )
         if v is not None
     }
+    birthday = None
+    if args.birthday is not None:
+        birthday = parse_birthday(args.birthday)
+        wanted["birthday"] = birthday_text(birthday)
+    src = None
+    if args.photo:
+        src = Path(args.photo).expanduser()
+        if not src.is_file():
+            die(f"no such file: {src}")
+        wanted["photo"] = str(src)
+    if args.remove_photo:
+        if not photos.photos:
+            die("there is no profile photo to remove")
+        wanted["photo"] = None
+
+    if args.photo_out:
+        out_dir = Path(args.photo_out).expanduser()
+        out_dir.mkdir(parents=True, exist_ok=True)
+        path = await cli.download_profile_photo(me, file=str(out_dir), download_big=True)
+        say(args, f"saved the current photo: {path}" if path else "there is no photo to save")
+        now["saved_photo"] = str(path) if path else None
+
     if not wanted:
         result(args, {**entity_row(me), **now}, "\n".join(f"{k:<10} : {v or ''}" for k, v in now.items()))
         return
 
     say(args, "about to change the profile — every contact sees this")
     for key, value in wanted.items():
+        if key == "photo":
+            if value is None:
+                say(args, f"  {'photo':<10}: delete the current one ({count} in history; the previous comes back)")
+            else:
+                say(args, f"  {'photo':<10}: {value}  ({Path(value).stat().st_size / 1024:.0f} KB), on top of {count}")
+            continue
         say(args, f"  {key:<10}: {now[key] or '(empty)'} -> {value or '(empty)'}")
     plan = {"before": now, "after": {**now, **wanted}}
     if not args.yes:
@@ -2757,7 +2831,227 @@ async def cmd_profile(cli, args) -> None:
             await cli(UpdateUsernameRequest(wanted["username"].lstrip("@")))
         except errors.UsernameOccupiedError:
             die(f"@{wanted['username']} is taken")
+    if args.birthday is not None:
+        await cli(UpdateBirthdayRequest(birthday=birthday))
+    if src is not None:
+        uploaded = await cli.upload_file(str(src))
+        video = src.suffix.lower() in (".mp4", ".mov", ".webm")
+        await cli(UploadProfilePhotoRequest(**({"video": uploaded} if video else {"file": uploaded})))
+    elif args.remove_photo:
+        p = photos.photos[0]
+        await cli(
+            DeletePhotosRequest(id=[InputPhoto(id=p.id, access_hash=p.access_hash, file_reference=p.file_reference)])
+        )
     result(args, {**plan, "dry_run": False}, "profile updated")
+
+
+# --- profile: photo, birthday, privacy ---------------------------------------
+
+
+def parse_birthday(text: str):
+    """`DD-MM` or `DD-MM-YYYY` as a Birthday; `none` clears it (returns None).
+
+    Day first, as on every form outside the US, and with the year optional
+    because Telegram treats it as optional: without it, people see the day but
+    not the age.
+    """
+    if text.strip().lower() in ("none", "clear", ""):
+        return None
+    m = re.fullmatch(r"(\d{1,2})-(\d{1,2})(?:-(\d{4}))?", text.strip())
+    if not m:
+        die(f"--birthday wants DD-MM or DD-MM-YYYY (or none), not {text!r}")
+    day, month = int(m[1]), int(m[2])
+    year = int(m[3]) if m[3] else None
+    try:
+        datetime(year or 2000, month, day)  # 2000 is a leap year, so 29-02 passes without one
+    except ValueError:
+        die(f"{text} is not a real day")
+    return Birthday(day=day, month=month, year=year)
+
+
+def birthday_text(b) -> str | None:
+    if b is None:
+        return None
+    return f"{b.day:02d}-{b.month:02d}" + (f"-{b.year}" if b.year else "")
+
+
+#: The privacy settings by the names Settings → Privacy uses, to the key the
+#: API takes. Order is the order the app lists them in.
+PRIVACY_KEYS = {
+    "phone": InputPrivacyKeyPhoneNumber,
+    "find-by-phone": InputPrivacyKeyAddedByPhone,
+    "last-seen": InputPrivacyKeyStatusTimestamp,
+    "photo": InputPrivacyKeyProfilePhoto,
+    "bio": InputPrivacyKeyAbout,
+    "birthday": InputPrivacyKeyBirthday,
+    "forwards": InputPrivacyKeyForwards,
+    "calls": InputPrivacyKeyPhoneCall,
+    "p2p": InputPrivacyKeyPhoneP2P,
+    "voice": InputPrivacyKeyVoiceMessages,
+    "invites": InputPrivacyKeyChatInvite,
+    "gifts": InputPrivacyKeyStarGiftsAutoSave,
+    "music": InputPrivacyKeySavedMusic,
+}
+
+#: The base rule each setting starts from; the exceptions are added to it.
+PRIVACY_BASE = {
+    "everybody": InputPrivacyValueAllowAll,
+    "contacts": InputPrivacyValueAllowContacts,
+    "nobody": InputPrivacyValueDisallowAll,
+}
+
+
+def privacy_rules(base: str, allow_users=(), deny_users=(), allow_chats=(), deny_chats=()) -> list:
+    """The rule list for account.setPrivacy: the exceptions first, the base last.
+
+    Telegram reads the list in order and the first rule that matches wins, so
+    "contacts, except X" has to put the disallow of X ahead of AllowContacts.
+    An exception that only repeats the base ("everybody, but allow X") would
+    be dead, and is refused so that the preview says what really happens.
+    """
+    if base not in PRIVACY_BASE:
+        die(f"--rule is one of {', '.join(PRIVACY_BASE)}")
+    if base == "everybody" and (allow_users or allow_chats):
+        die("everybody can already see it; an --allow exception does nothing there")
+    if base == "nobody" and (deny_users or deny_chats):
+        die("nobody can already see it; a --deny exception does nothing there")
+    rules: list = []
+    if allow_users:
+        rules.append(InputPrivacyValueAllowUsers(users=list(allow_users)))
+    if allow_chats:
+        rules.append(InputPrivacyValueAllowChatParticipants(chats=list(allow_chats)))
+    if deny_users:
+        rules.append(InputPrivacyValueDisallowUsers(users=list(deny_users)))
+    if deny_chats:
+        rules.append(InputPrivacyValueDisallowChatParticipants(chats=list(deny_chats)))
+    rules.append(PRIVACY_BASE[base]())
+    return rules
+
+
+def describe_rules(rules, names: dict[int, str] | None = None) -> dict:
+    """A PrivacyRule list as {"rule": base, "allow": [...], "deny": [...]}.
+
+    `names` maps the user and chat ids in the reply to readable names; the
+    reply to getPrivacy carries those users and chats beside the rules.
+    """
+    names = names or {}
+    out: dict = {"rule": "nobody", "allow": [], "deny": []}
+    for r in rules:
+        kind_ = type(r).__name__.removeprefix("PrivacyValue")
+        if kind_ == "AllowAll":
+            out["rule"] = "everybody"
+        elif kind_ == "AllowContacts":
+            out["rule"] = "contacts"
+        elif kind_ == "DisallowAll":
+            out["rule"] = "nobody"
+        else:
+            ids = getattr(r, "users", None) or getattr(r, "chats", None) or []
+            who = [names.get(i, str(i)) for i in ids] or [kind_.removeprefix("Allow").removeprefix("Disallow").lower()]
+            out["allow" if kind_.startswith("Allow") else "deny"] += who
+    return out
+
+
+def rules_text(d: dict) -> str:
+    text = d["rule"]
+    if d["allow"]:
+        text += f", also {', '.join(d['allow'])}"
+    if d["deny"]:
+        text += f", except {', '.join(d['deny'])}"
+    return text
+
+
+async def privacy_targets(cli, refs: list[str] | None) -> tuple[list, list[int], list[str]]:
+    """Resolve --allow/--deny references into (input users, chat ids, names)."""
+    users, chats, names = [], [], []
+    for ref in refs or []:
+        entity = await resolve(cli, ref)
+        names.append(label(entity))
+        if isinstance(entity, User):
+            users.append(await cli.get_input_entity(entity))
+        else:
+            chats.append(entity.id)
+    return users, chats, names
+
+
+async def read_privacy(cli) -> dict[str, dict]:
+    settings = {}
+    for name, key in PRIVACY_KEYS.items():
+        try:
+            res = await cli(GetPrivacyRequest(key=key()))
+        except errors.RPCError as exc:  # a key this account or layer does not offer
+            settings[name] = {"error": str(exc)}
+            continue
+        names = {u.id: label(u) for u in res.users} | {c.id: label(c) for c in res.chats}
+        settings[name] = describe_rules(res.rules, names)
+    return settings
+
+
+async def cmd_privacy(cli, args) -> None:
+    """Show or change Settings → Privacy and Security.
+
+    With no change asked for it lists every privacy setting, how long the
+    account survives being away, and whether chats from strangers are archived.
+    A change is a dry run until --yes: it decides who can see the phone
+    number or call, and a mistake there is quiet until someone uses it.
+    """
+    wants_rule = args.key is not None or args.rule is not None
+    if wants_rule and (args.key is None or args.rule is None):
+        die("--key and --rule go together: which setting, and who may see it")
+    if (args.allow or args.deny) and not wants_rule:
+        die("--allow and --deny are exceptions to a --key/--rule change")
+    if args.away_days is not None and not 30 <= args.away_days <= 730:
+        die("--away-days is between 30 and 730")
+    if not (wants_rule or args.away_days is not None or args.archive_strangers):
+        settings = await read_privacy(cli)
+        ttl = (await cli(GetAccountTTLRequest())).days
+        glob = await cli(GetGlobalPrivacySettingsRequest())
+        data = {
+            "privacy": settings,
+            "away_days": ttl,
+            "archive_strangers": bool(glob.archive_and_mute_new_noncontact_peers),
+        }
+        lines = [f"{k:<14}: {v.get('error') or rules_text(v)}" for k, v in settings.items()]
+        lines.append(f"{'away-days':<14}: delete the account after {ttl} days away")
+        lines.append(f"{'archive':<14}: {'on' if data['archive_strangers'] else 'off'} (new chats from non-contacts)")
+        result(args, data, "\n".join(lines))
+        return
+
+    plan: dict = {}
+    say(args, "about to change privacy settings")
+    if wants_rule:
+        if args.key not in PRIVACY_KEYS:
+            die(f"--key is one of {', '.join(PRIVACY_KEYS)}")
+        if args.key == "find-by-phone" and args.rule == "nobody":
+            die("find-by-phone takes everybody or contacts; Telegram has no nobody for it")
+        allow_u, allow_c, allow_n = await privacy_targets(cli, args.allow)
+        deny_u, deny_c, deny_n = await privacy_targets(cli, args.deny)
+        rules = privacy_rules(args.rule, allow_u, deny_u, allow_c, deny_c)
+        res = await cli(GetPrivacyRequest(key=PRIVACY_KEYS[args.key]()))
+        names = {u.id: label(u) for u in res.users} | {c.id: label(c) for c in res.chats}
+        before = describe_rules(res.rules, names)
+        after = {"rule": args.rule, "allow": allow_n, "deny": deny_n}
+        say(args, f"  {args.key:<12}: {rules_text(before)} -> {rules_text(after)}")
+        plan[args.key] = {"before": before, "after": after}
+    if args.away_days is not None:
+        ttl = (await cli(GetAccountTTLRequest())).days
+        say(args, f"  {'away-days':<12}: {ttl} -> {args.away_days}")
+        plan["away_days"] = {"before": ttl, "after": args.away_days}
+    if args.archive_strangers:
+        glob = await cli(GetGlobalPrivacySettingsRequest())
+        now = bool(glob.archive_and_mute_new_noncontact_peers)
+        say(args, f"  {'archive':<12}: {'on' if now else 'off'} -> {args.archive_strangers}")
+        plan["archive_strangers"] = {"before": now, "after": args.archive_strangers == "on"}
+    if not args.yes:
+        dry_run(args, plan, "DRY RUN — privacy unchanged. Re-run with --yes to apply.")
+        return
+    if wants_rule:
+        await cli(SetPrivacyRequest(key=PRIVACY_KEYS[args.key](), rules=rules))
+    if args.away_days is not None:
+        await cli(SetAccountTTLRequest(ttl=AccountDaysTTL(days=args.away_days)))
+    if args.archive_strangers:
+        glob.archive_and_mute_new_noncontact_peers = args.archive_strangers == "on"
+        await cli(SetGlobalPrivacySettingsRequest(settings=glob))
+    result(args, {**plan, "dry_run": False}, "privacy updated")
 
 
 # --- polls -------------------------------------------------------------------
@@ -3523,7 +3817,7 @@ MCP_INSTRUCTIONS = """\
 These tools act on the user's own Telegram account: whatever they send appears as the user typing it.
 
 - Every write (send, send_file, edit, delete, forward, react, draft, pin, mute, archive, join, leave, poll, \
-profile, folder, chat_photo, create_group, sessions with terminate) is a DRY RUN unless `yes` is true. \
+profile, privacy, folder, chat_photo, create_group, sessions with terminate) is a DRY RUN unless `yes` is true. \
 Call it without `yes` first, show the user the recipient and the exact text from the preview, and call again \
 with `yes: true` only after they agree. Never compose and deliver in one step.
 - When a reply is wanted but not yet approved, prefer `draft`: it puts the text in the chat's input box for \
@@ -4256,13 +4550,27 @@ def build_parser() -> argparse.ArgumentParser:
     sp.add_argument("--yes", action="store_true", help="actually add them (otherwise dry run)")
     sp.set_defaults(fn=cmd_invite)
 
-    sp = sub.add_parser("profile", help="show your profile, or change name, bio or username")
+    sp = sub.add_parser("profile", help="show your profile, or change name, bio, username, birthday or photo")
     sp.add_argument("--first", help="first name")
     sp.add_argument("--last", help="last name")
     sp.add_argument("--bio", help="the about line")
     sp.add_argument("--username", help="the public @username")
+    sp.add_argument("--birthday", help="DD-MM or DD-MM-YYYY; none clears it")
+    sp.add_argument("--photo", metavar="FILE", help="set a new profile photo (an image, or an .mp4 for a video)")
+    sp.add_argument("--remove-photo", action="store_true", help="delete the current photo; the previous one returns")
+    sp.add_argument("--photo-out", metavar="DIR", help="save the current photo into this directory first")
     sp.add_argument("--yes", action="store_true", help="actually apply (otherwise dry run)")
     sp.set_defaults(fn=cmd_profile)
+
+    sp = sub.add_parser("privacy", help="show or change privacy: who sees your phone, last seen, photo, and more")
+    sp.add_argument("--key", choices=list(PRIVACY_KEYS), help="the setting to change")
+    sp.add_argument("--rule", choices=list(PRIVACY_BASE), help="who may: everybody, contacts or nobody")
+    sp.add_argument("--allow", action="append", help="an exception who may anyway: a person or a group; repeatable")
+    sp.add_argument("--deny", action="append", help="an exception who may not: a person or a group; repeatable")
+    sp.add_argument("--away-days", type=int, help="delete the account after this many days away (30-730)")
+    sp.add_argument("--archive-strangers", choices=["on", "off"], help="archive and mute new chats from non-contacts")
+    sp.add_argument("--yes", action="store_true", help="actually apply (otherwise dry run)")
+    sp.set_defaults(fn=cmd_privacy)
 
     sp = sub.add_parser("poll", help="send a poll or a quiz")
     sp.add_argument("--chat", required=True, help=CHAT_HELP)
