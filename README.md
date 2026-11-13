@@ -11,7 +11,7 @@
 
 # <img src="assets/logo.svg" alt="" width="36" align="top"> ELBoT
 
-> **EL** is for **Elaheh** (الهه). The bot is named for her, and the heart that starts the paper plane's trail in the logo is hers.
+> **EL** is for **Elaheh**. The bot is named for her, and the heart that starts the paper plane's trail in the logo is hers.
 
 A personal Telegram secretary that logs in as the account itself over MTProto (via [Telethon](https://codeberg.org/Lonami/Telethon)) — so it can read any chat backwards, search the whole archive, see every group and channel, send as the user with full markdown/HTML/quote formatting, upload files, react, mark chats read, and manage folders.
 
