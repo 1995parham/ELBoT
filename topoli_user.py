@@ -2935,19 +2935,19 @@ def describe_rules(rules, names: dict[int, str] | None = None) -> dict:
     reply to getPrivacy carries those users and chats beside the rules.
     """
     names = names or {}
-    out: dict = {"rule": "nobody", "allow": [], "deny": []}
+    out: dict = {"rule": None, "allow": [], "deny": []}
+    bases = {"AllowAll": "everybody", "AllowContacts": "contacts", "DisallowAll": "nobody"}
     for r in rules:
         kind_ = type(r).__name__.removeprefix("PrivacyValue")
-        if kind_ == "AllowAll":
-            out["rule"] = "everybody"
-        elif kind_ == "AllowContacts":
-            out["rule"] = "contacts"
-        elif kind_ == "DisallowAll":
-            out["rule"] = "nobody"
+        if kind_ in bases:
+            # The first base rule decides; Telegram stores "contacts" as
+            # AllowContacts followed by DisallowAll, and the second never applies.
+            out["rule"] = out["rule"] or bases[kind_]
         else:
             ids = getattr(r, "users", None) or getattr(r, "chats", None) or []
             who = [names.get(i, str(i)) for i in ids] or [kind_.removeprefix("Allow").removeprefix("Disallow").lower()]
             out["allow" if kind_.startswith("Allow") else "deny"] += who
+    out["rule"] = out["rule"] or "nobody"
     return out
 
 

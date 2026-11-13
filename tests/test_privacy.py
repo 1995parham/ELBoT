@@ -76,6 +76,11 @@ class TestRules:
         assert d == {"rule": "contacts", "allow": [], "deny": ["Ali"]}
         assert t.rules_text(d) == "contacts, except Ali"
 
+    def test_the_first_base_rule_wins(self):
+        """Telegram returns "contacts" as AllowContacts then DisallowAll."""
+        d = t.describe_rules([PrivacyValueAllowContacts(), PrivacyValueDisallowAll()])
+        assert d["rule"] == "contacts"
+
     def test_no_base_rule_reads_as_nobody(self):
         d = t.describe_rules([PrivacyValueAllowUsers(users=[5])])
         assert d == {"rule": "nobody", "allow": ["5"], "deny": []}
