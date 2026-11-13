@@ -1,4 +1,17 @@
-# ELBoT
+<p align="center">
+    <img src="assets/banner.svg" alt="ELBoT, your Telegram secretary" width="100%">
+</p>
+
+<p align="center">
+    <a href="https://github.com/1995parham/ELBoT/actions/workflows/ci.yml"><img src="https://github.com/1995parham/ELBoT/actions/workflows/ci.yml/badge.svg" alt="ci"></a>
+    <img src="https://img.shields.io/badge/python-3.14-3776AB?logo=python&logoColor=white" alt="Python 3.14">
+    <img src="https://img.shields.io/badge/MCP-server-FF7A3D" alt="MCP server">
+    <a href="LICENSE"><img src="https://img.shields.io/badge/license-MIT-2AABEE" alt="MIT license"></a>
+</p>
+
+# <img src="assets/logo.svg" alt="" width="36" align="top"> ELBoT
+
+> **EL** is for **Elaheh** (الهه). The bot is named for her, and the heart that starts the paper plane's trail in the logo is hers.
 
 A personal Telegram secretary that logs in as the account itself over MTProto (via [Telethon](https://codeberg.org/Lonami/Telethon)) — so it can read any chat backwards, search the whole archive, see every group and channel, send as the user with full markdown/HTML/quote formatting, upload files, react, mark chats read, and manage folders.
 

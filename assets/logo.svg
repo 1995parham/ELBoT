@@ -1,0 +1,19 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 512 512" width="512" height="512" role="img" aria-label="ELBoT logo">
+  <defs>
+    <linearGradient id="ltile" x1="0" y1="0" x2="1" y2="1">
+      <stop offset="0" stop-color="#37BBFE"/><stop offset=".55" stop-color="#1D8BE0"/><stop offset="1" stop-color="#1565C0"/>
+    </linearGradient>
+    <linearGradient id="lwarm" x1="0" y1="0" x2="1" y2="1">
+      <stop offset="0" stop-color="#FFB547"/><stop offset="1" stop-color="#FF7A3D"/>
+    </linearGradient>
+    <radialGradient id="lshine" cx=".25" cy=".15" r=".8">
+      <stop offset="0" stop-color="#fff" stop-opacity=".28"/><stop offset="1" stop-color="#fff" stop-opacity="0"/>
+    </radialGradient>
+  </defs>
+  <rect width="512" height="512" rx="116" fill="url(#ltile)"/>
+  <rect width="512" height="512" rx="116" fill="url(#lshine)"/>
+  <path d="M108 428 C 190 470, 330 470, 372 330 S 400 170, 418 130" fill="none" stroke="#fff" stroke-opacity=".55" stroke-width="9" stroke-linecap="round" stroke-dasharray="2 22"/>
+  <path d="M104.0,448.4 C85.4,434.4 75.0,422.8 75.0,412.4 C75.0,403.1 82.0,397.3 90.1,397.3 C96.5,397.3 101.7,401.4 104.0,406.6 C106.3,401.4 111.5,397.3 117.9,397.3 C126.0,397.3 133.0,403.1 133.0,412.4 C133.0,422.8 122.6,434.4 104.0,448.4 Z" fill="url(#lwarm)"/>
+  <path d="M215.8 305.6V340H113.6V305.6ZM129.1 148V340H84.6V148ZM202.6 224.8V258H113.6V224.8ZM216 148V182.6H113.6V148ZM361.7 305.6V340H264.8V305.6ZM280.4 148V340H235.8V148Z" fill="#fff"/>
+  <path d="M366.2,101.8 L461.8,62.3 L434.8,149.7 L409.8,120.6 Z" fill="#fff"/><path d="M409.8,120.6 L461.8,62.3 L401.5,114.3 L399.4,141.4 Z" fill="#D6ECFB"/>
+</svg>
