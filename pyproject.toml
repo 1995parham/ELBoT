@@ -1,6 +1,6 @@
 [project]
 name = "elbot"
-version = "0.5.0"
+version = "0.6.0"
 description = "Parham's Telegram secretary — a user-mode MTProto client"
 readme = "README.md"
 requires-python = ">=3.14"
@@ -10,6 +10,7 @@ authors = [{ name = "Parham Alvani", email = "parham.alvani@gmail.com" }]
 dependencies = [
     "telethon>=1.41",
     "python-socks[asyncio]>=2.4",
+    "qrcode>=8.0",
 ]
 
 [project.urls]

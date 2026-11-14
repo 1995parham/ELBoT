@@ -27,13 +27,23 @@ It is built to be driven by an AI agent as much as by a person: every command is
     uv run topoli_user.py setup --api-id 123456 --api-hash 0123456789abcdef0123456789abcdef --phone +34XXXXXXXXX
     ```
 
-2. Log in. Telegram sends the code to your other devices (or by SMS/email); the code and the 2FA password are two separate steps, so it works without a terminal prompt:
+2. Log in. The easiest way is a QR code, scanned from a phone where the account is already logged in (Settings → Devices → Link Desktop Device). No code is sent, so nothing can get lost on the way:
+
+    ```bash
+    uv run topoli_user.py login --qr --open           # opens a page with the QR code; add --password … for 2FA
+    uv run topoli_user.py whoami
+    ```
+
+    The token behind the QR code lives about 30 seconds, so ELBoT draws a new one before each expires and the page reloads itself. In a terminal it also prints the code in block characters. If the account has 2FA and no password was given, the scan is kept and `login --password …` finishes it.
+
+    Without a phone at hand, log in with a code. Telegram sends it into the Telegram app of another device of the account, never by SMS to a client like this one, so with no other device logged in it never arrives. The code and the 2FA password are two separate steps, so it works without a terminal prompt:
 
     ```bash
     uv run topoli_user.py login                       # sends the code
     uv run topoli_user.py login --code 12345          # add --password … if the account has 2FA
-    uv run topoli_user.py whoami
     ```
+
+    One auth key used from two IP addresses at once (say, through a proxy and directly) is revoked by Telegram for good, and every command then fails with `AuthKeyDuplicatedError`. Move the `.authkey` file aside and log in again.
 
 3. Where Telegram is blocked, point it at a proxy: `TOPOLI_PROXY=socks5://127.0.0.1:1080` (or `http://…`). Telethon ignores the usual proxy variables, so ELBoT reads `TOPOLI_PROXY` first and falls back to `all_proxy`, `https_proxy` and `http_proxy`.
 

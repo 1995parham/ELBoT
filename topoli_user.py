@@ -1,7 +1,7 @@
 #!/usr/bin/env -S uv run --quiet --script
 # /// script
 # requires-python = ">=3.14"
-# dependencies = ["telethon>=1.41", "python-socks[asyncio]>=2.4"]
+# dependencies = ["telethon>=1.41", "python-socks[asyncio]>=2.4", "qrcode>=8.0"]
 # ///
 """Automated Topoli — user-account mode (MTProto via Telethon).
 
@@ -254,7 +254,7 @@ def invocation() -> str:
     return base if default_account() == ACCOUNT else f"{base} --account {ACCOUNT}"
 
 
-VERSION = "0.5.0"
+VERSION = "0.6.0"
 
 #: Set while a command runs with --json, so `die` can answer in the same
 #: format: a caller parsing stdout must get an object, not an empty string.
@@ -1080,6 +1080,141 @@ async def cmd_setup(cli, args) -> None:  # never reaches the network
     print(f"next: {invocation()} login")
 
 
+# --------------------------------------------------------------------------
+# QR login — scan from a phone instead of typing a code
+# --------------------------------------------------------------------------
+#
+# A login code is sent into the Telegram app of another device of the account,
+# never by SMS to a third-party client. When no other device is reachable the
+# code goes nowhere, and Telegram still answers "sent". A QR login asks for no
+# code at all: the phone, already logged in, scans the token and approves it
+# (Settings → Devices → Link Desktop Device). The token lives about 30 seconds,
+# so the picture is redrawn before each one expires, not after: a phone that
+# scans a token in its last second gets AUTH_TOKEN_EXPIRED.
+
+QR_MARGIN = 8  # seconds before expiry at which a fresh token is drawn
+
+
+def qr_matrix(data: str) -> list[list[bool]]:
+    """The QR modules for `data`, True for dark, with the 4-module quiet zone."""
+    import qrcode
+
+    qr = qrcode.QRCode(border=4, error_correction=qrcode.constants.ERROR_CORRECT_M)
+    qr.add_data(data)
+    qr.make(fit=True)
+    return [list(row) for row in qr.get_matrix()]
+
+
+def qr_text(matrix: list[list[bool]]) -> str:
+    """Two rows per line in half blocks, light modules drawn, dark ones blank.
+
+    Drawing the light modules makes it dark-on-light on a dark terminal, the
+    way a phone camera expects it.
+    """
+    rows = [*matrix, [False] * len(matrix[0])] if len(matrix) % 2 else matrix
+    glyph = {(True, True): "█", (True, False): "▀", (False, True): "▄", (False, False): " "}
+    return "\n".join(
+        "".join(glyph[(not top, not bottom)] for top, bottom in zip(rows[i], rows[i + 1], strict=True))
+        for i in range(0, len(rows), 2)
+    )
+
+
+def qr_svg(matrix: list[list[bool]], scale: int = 8) -> str:
+    size = len(matrix) * scale
+    cells = "".join(
+        f"M{x * scale},{y * scale}h{scale}v{scale}h-{scale}z"
+        for y, row in enumerate(matrix)
+        for x, dark in enumerate(row)
+        if dark
+    )
+    return (
+        f'<svg xmlns="http://www.w3.org/2000/svg" width="{size}" height="{size}" viewBox="0 0 {size} {size}">'
+        f'<rect width="100%" height="100%" fill="#fff"/><path d="{cells}" fill="#000"/></svg>'
+    )
+
+
+def qr_page(body: str, refresh: bool = True) -> str:
+    """A page that reloads itself every second, so a new token shows at once."""
+    meta = '<meta http-equiv="refresh" content="1">' if refresh else ""
+    return (
+        f'<!doctype html><html><head><meta charset="utf-8">{meta}<title>ELBoT login · {ACCOUNT}</title></head>'
+        '<body style="background:#fff;color:#111;font-family:sans-serif;text-align:center;padding:24px">'
+        f"{body}</body></html>"
+    )
+
+
+def open_file(path: Path) -> None:
+    import subprocess
+
+    cmd = "open" if sys.platform == "darwin" else "xdg-open"
+    with contextlib.suppress(OSError):
+        subprocess.Popen([cmd, str(path)], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+
+
+async def login_qr(cli, args, password: str | None) -> None:
+    page = STATE_DIR / f"login-qr-{ACCOUNT}.html"
+    STATE_DIR.mkdir(parents=True, exist_ok=True)
+    live = sys.stdout.isatty()
+    deadline = datetime.now(UTC) + timedelta(seconds=args.qr_timeout)
+    qr = await cli.qr_login()
+    print(f"QR page: {page}", flush=True)
+    print("scan it from the account's phone: Settings → Devices → Link Desktop Device", flush=True)
+    opened = False
+    try:
+        while True:
+            matrix = qr_matrix(qr.url)
+            stamp = qr.expires.astimezone().strftime("%H:%M:%S")
+            page.write_text(
+                qr_page(
+                    f"<h2>Log ELBoT in as account {ACCOUNT!r}</h2>"
+                    "<p>On the phone: Settings → Devices → Link Desktop Device</p>"
+                    f"{qr_svg(matrix)}<p>this code is good until {stamp}</p>"
+                )
+            )
+            page.chmod(0o600)
+            if args.open and not opened:
+                open_file(page)
+                opened = True
+            if live:
+                print(f"\n{qr_text(matrix)}\ngood until {stamp}", flush=True)
+            if datetime.now(UTC) >= deadline:
+                die(f"nobody scanned the QR code within {args.qr_timeout}s; run login --qr again")
+            left = (qr.expires - datetime.now(UTC)).total_seconds() - QR_MARGIN
+            try:
+                await qr.wait(timeout=max(left, 3))
+                break
+            except TimeoutError:
+                await qr.recreate()
+            except errors.SessionPasswordNeededError:
+                # The scan is accepted and held by this session's auth key, so
+                # the password can come from a later run of `login --password`.
+                if not password:
+                    page.write_text(qr_page("<h2>Scanned. Now the 2FA password, in the terminal.</h2>", False))
+                    die(
+                        "scanned. This account has two-step verification; finish with:\n"
+                        f"    {invocation()} login --password <2fa>   (or set TOPOLI_2FA_PASSWORD)"
+                    )
+                try:
+                    await cli.sign_in(password=password)
+                except errors.PasswordHashInvalidError:
+                    die(f"that 2FA password is wrong; finish with {invocation()} login --password <2fa>")
+                break
+    except errors.AuthTokenExpiredError:
+        die("the phone scanned an expired code; run login --qr again and scan the newest one")
+    page.write_text(qr_page("<h2>Logged in. You can close this page.</h2>", False))
+    await finish_login(cli)
+
+
+async def finish_login(cli) -> None:
+    PENDING.unlink(missing_ok=True)
+    export_session(cli)
+    secure_session()
+    me = await cli.get_me()
+    print(f"logged in as {label(me)}  id={me.id}")
+    print(f"auth key written to {SESSION_STRING}")
+    print("treat it as a password: it logs anyone holding it in as you, with no 2FA")
+
+
 async def cmd_login(cli, args) -> None:
     """Two-step login, because stdin is not always a terminal.
 
@@ -1096,6 +1231,10 @@ async def cmd_login(cli, args) -> None:
 
     password = args.password or os.environ.get("TOPOLI_2FA_PASSWORD")
 
+    if args.qr:
+        await login_qr(cli, args, password)
+        return
+
     # The code and the password are two separate server-side steps. Once the
     # code has been accepted, it is spent, and only auth.checkPassword remains
     # — which rides the session's auth_key and so survives a process restart.
@@ -1106,13 +1245,7 @@ async def cmd_login(cli, args) -> None:
             await cli.sign_in(password=password)
         except errors.PasswordHashInvalidError:
             die("that 2FA password is wrong")
-        PENDING.unlink(missing_ok=True)
-        export_session(cli)
-        secure_session()
-        me = await cli.get_me()
-        print(f"logged in as {label(me)}  id={me.id}")
-        print(f"auth key written to {SESSION_STRING}")
-        print("treat it as a password: it logs anyone holding it in as you, with no 2FA")
+        await finish_login(cli)
         return
 
     # A phone in api-<account>.json is that account's. The one in the shared
@@ -1169,13 +1302,7 @@ async def cmd_login(cli, args) -> None:
         PENDING.unlink(missing_ok=True)
         die("that code expired. Request a new one with --phone")
 
-    PENDING.unlink(missing_ok=True)
-    export_session(cli)
-    secure_session()
-    me = await cli.get_me()
-    print(f"logged in as {label(me)}  id={me.id}")
-    print(f"auth key written to {SESSION_STRING}")
-    print("treat it as a password: it logs anyone holding it in as you, with no 2FA")
+    await finish_login(cli)
 
 
 async def cmd_whoami(cli, args) -> None:
@@ -4282,7 +4409,14 @@ def build_parser() -> argparse.ArgumentParser:
     sp.add_argument("--local", action="store_true", help="write to the machine-local state dir instead of the repo")
     sp.set_defaults(fn=cmd_setup, offline=True)
 
-    sp = sub.add_parser("login", help="first-time login: --phone, then --code")
+    sp = sub.add_parser("login", help="first-time login: --qr, or --phone then --code")
+    sp.add_argument(
+        "--qr",
+        action="store_true",
+        help="scan a QR code from a phone already logged in, instead of a code (no code is sent)",
+    )
+    sp.add_argument("--open", action="store_true", help="with --qr: open the QR page in the browser")
+    sp.add_argument("--qr-timeout", type=int, default=300, help="with --qr: seconds to wait for a scan (300)")
     sp.add_argument("--phone", help="phone in international form, e.g. +98XXXXXXXXXX")
     sp.add_argument("--code", help="the code Telegram sent to step one")
     sp.add_argument("--password", help="2FA password (or set TOPOLI_2FA_PASSWORD)")
@@ -4681,6 +4815,13 @@ def main() -> None:
         print("\ninterrupted", file=sys.stderr)
     except errors.FloodWaitError as exc:
         die(f"rate limited by Telegram; retry in {exc.seconds}s")
+    except (errors.AuthKeyDuplicatedError, errors.AuthKeyUnregisteredError) as exc:
+        # A revoked key fails before any command runs, `login` included, so
+        # say how to get past it rather than leave the bare RPC message.
+        die(
+            f"the auth key for account {ACCOUNT!r} is dead ({type(exc).__name__}); Telegram revoked it.\n"
+            f"move {SESSION_STRING} aside, then log in again: {invocation()} login --qr --open"
+        )
     except errors.RPCError as exc:
         die(f"Telegram error: {exc}")
 
