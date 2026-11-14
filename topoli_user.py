@@ -62,6 +62,7 @@ try:
         UpdateProfileRequest,
         UpdateUsernameRequest,
     )
+    from telethon.tl.functions.auth import ResendCodeRequest
     from telethon.tl.functions.channels import (
         CreateChannelRequest,
         EditPhotoRequest,
@@ -254,7 +255,7 @@ def invocation() -> str:
     return base if default_account() == ACCOUNT else f"{base} --account {ACCOUNT}"
 
 
-VERSION = "0.6.0"
+VERSION = "0.7.0"
 
 #: Set while a command runs with --json, so `die` can answer in the same
 #: format: a caller parsing stdout must get an object, not an empty string.
@@ -440,6 +441,7 @@ def cache_path(cache: str) -> Path:
     not die on "database is locked". A private cache is deleted on exit.
     """
     STATE_DIR.mkdir(parents=True, exist_ok=True)
+    sweep_caches()
     for path in (
         SESSION.with_name(f"{SESSION.stem}-{cache}.session"),
         SESSION.with_name(f"{SESSION.stem}-{cache}-{os.getpid()}.session"),
@@ -457,6 +459,129 @@ def cache_path(cache: str) -> Path:
     die(f"cannot lock a cache for {cache!r} in {STATE_DIR}")
 
 
+def sweep_caches(dry_run: bool = False) -> list[Path]:
+    """Private caches (`<account>-<cache>-<pid>.session`) whose process is gone.
+
+    A private cache is deleted on a clean exit, but a killed MCP server leaves
+    it behind, and they pile up by the dozen. One whose lock nobody holds
+    belongs to no running process, so it can go.
+    """
+    stale = []
+    for lock_path in sorted(STATE_DIR.glob("*-*-[0-9]*.lock")):
+        if not re.fullmatch(r".+-\d+", lock_path.stem):
+            continue
+        with lock_path.open("a") as lock:
+            try:
+                fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
+            except OSError:
+                continue  # its process is alive
+            for path in (
+                lock_path.with_suffix(".session"),
+                lock_path.with_suffix(".session-journal"),
+                lock_path,
+            ):
+                if path.exists():
+                    stale.append(path)
+                    if not dry_run:
+                        path.unlink(missing_ok=True)
+    return stale
+
+
+# --------------------------------------------------------------------------
+# key guard — one auth key, one network route at a time
+# --------------------------------------------------------------------------
+#
+# Telegram revokes an auth key for good when it sees the key connected from
+# two IP addresses at once (AUTH_KEY_DUPLICATED). Many processes on one key are
+# fine — every Claude session starts its own MCP server — as long as they all
+# leave through the same route. The killer is mixing routes: one process
+# through a proxy, another direct. That took the `spain` key on 2026-11-14.
+#
+# So every process that opens a key registers the route it will use, in
+# `<state>/keys/<account>/<pid>.json`, and holds a lock on that file while it
+# lives. Before connecting, a process reads the other live registrations and
+# refuses to start on a different route. A file whose lock is free belongs to
+# a process that is gone and is removed. TOPOLI_ALLOW_MIXED_ROUTES=1 overrides
+# the refusal, for the rare case of knowing better.
+
+
+def route_label(px: tuple[str, str, int] | None = None) -> str:
+    """The route a connection takes: `direct`, or the proxy as scheme://host:port."""
+    px = proxy() if px is None else px
+    return f"{px[0]}://{px[1]}:{px[2]}" if px else "direct"
+
+
+def key_users_dir(account: str | None = None) -> Path:
+    return STATE_DIR / "keys" / (account or ACCOUNT)
+
+
+def key_users(account: str | None = None) -> list[dict]:
+    """The live processes registered on an account's key, stale ones removed."""
+    folder = key_users_dir(account)
+    if not folder.is_dir():
+        return []
+    rows = []
+    for path in sorted(folder.glob("*.json")):
+        if path.stem == str(os.getpid()):
+            continue
+        with path.open("a") as probe:
+            try:
+                fcntl.flock(probe, fcntl.LOCK_EX | fcntl.LOCK_NB)
+            except OSError:
+                pass  # held: the process is alive
+            else:
+                path.unlink(missing_ok=True)  # nobody holds it: the process is gone
+                continue
+        with contextlib.suppress(OSError, json.JSONDecodeError):
+            rows.append(json.loads(path.read_text()))
+    return rows
+
+
+def mixed_routes(route: str, users: list[dict]) -> list[dict]:
+    """The registered processes that would put a second route on the key."""
+    return [u for u in users if u.get("route") != route]
+
+
+#: Accounts this process has registered on, so a second client() is a no-op.
+_CLAIMED: set[str] = set()
+
+
+def claim_key() -> None:
+    """Register this process on the account's key, or refuse a second route."""
+    route = route_label()
+    clash = mixed_routes(route, key_users())
+    if clash and os.environ.get("TOPOLI_ALLOW_MIXED_ROUTES") != "1":
+        who = "\n".join(f"    pid {u.get('pid')} ({u.get('command', '?')}) via {u.get('route')}" for u in clash)
+        die(
+            f"account {ACCOUNT!r}: this run would connect via {route}, but its key is in use via another route:\n"
+            f"{who}\n"
+            "Telegram revokes a key it sees from two IP addresses at once (AUTH_KEY_DUPLICATED), and only a new\n"
+            "login brings it back. Use the same route as those processes (set or unset TOPOLI_PROXY / all_proxy /\n"
+            "https_proxy / http_proxy), or stop them first. `doctor` shows every key's users."
+        )
+    if ACCOUNT in _CLAIMED:
+        return
+    folder = key_users_dir()
+    folder.mkdir(parents=True, exist_ok=True)
+    path = folder / f"{os.getpid()}.json"
+    handle = path.open("w")
+    fcntl.flock(handle, fcntl.LOCK_EX)
+    _CLAIMED.add(ACCOUNT)
+    handle.write(
+        json.dumps(
+            {
+                "pid": os.getpid(),
+                "route": route,
+                "command": " ".join(sys.argv[1:4]) or "?",
+                "since": datetime.now(UTC).isoformat(timespec="seconds"),
+            }
+        )
+    )
+    handle.flush()
+    _HELD.append(handle)
+    atexit.register(path.unlink, missing_ok=True)
+
+
 def client(cache: str | None = None) -> TelegramClient:
     """A client on the shared auth key.
 
@@ -466,6 +591,7 @@ def client(cache: str | None = None) -> TelegramClient:
     the second gets "database is locked". A cache of its own sidesteps that.
     """
     api_id, api_hash = credentials()
+    claim_key()
     path = cache_path(cache) if cache else SESSION
     who = device_identity()
     return TelegramClient(
@@ -1215,6 +1341,38 @@ async def finish_login(cli) -> None:
     print("treat it as a password: it logs anyone holding it in as you, with no 2FA")
 
 
+def describe_code(kind) -> str:
+    """Where Telegram says it sent a login code, in words a person can act on."""
+    name = type(kind).__name__.removeprefix("SentCodeType")
+    length = getattr(kind, "length", None)
+    digits = f"a {length}-digit code" if length else "a code"
+    return {
+        "App": f"{digits} into the Telegram app of another device logged in as this account — not by SMS. "
+        "With no such device it reaches nobody; use login --qr instead",
+        "Sms": f"{digits} by SMS",
+        "Call": f"{digits}, read out in a phone call",
+        "FlashCall": "a flash call: the code is the calling number",
+        "MissedCall": f"a missed call: the code is the last {length or 'few'} digits of the calling number",
+        "EmailCode": f"{digits} by email to {getattr(kind, 'email_pattern', 'the login email')}",
+        "SetUpEmailRequired": "nothing yet: Telegram wants a login email set up first, in the official app",
+        "FragmentSms": f"{digits} through Fragment ({getattr(kind, 'url', 'fragment.com')})",
+        "FirebaseSms": f"{digits} by SMS through the official app's Firebase check, which ELBoT cannot pass",
+        "SmsWord": "an SMS with a word to type",
+        "SmsPhrase": "an SMS with a phrase to type",
+    }.get(name, f"{digits} ({name})")
+
+
+def report_code(sent, phone: str) -> None:
+    print(f"code sent to {phone}: {describe_code(sent.type)}")
+    if sent.next_type:
+        wait = f" after {sent.timeout}s" if sent.timeout else ""
+        nxt = describe_code(sent.next_type).split(" — ")[0]
+        print(f"not there? `login --resend`{wait} asks Telegram for {nxt}")
+    else:
+        print("Telegram offers no other way for this number; if it does not come, use login --qr")
+    print("each new request makes the older codes invalid: always type the newest one")
+
+
 async def cmd_login(cli, args) -> None:
     """Two-step login, because stdin is not always a terminal.
 
@@ -1233,6 +1391,25 @@ async def cmd_login(cli, args) -> None:
 
     if args.qr:
         await login_qr(cli, args, password)
+        return
+
+    if args.resend:
+        if not PENDING.is_file():
+            die(f"no code login in progress. Start with: {invocation()} login")
+        pending = json.loads(PENDING.read_text())
+        try:
+            sent = await cli(
+                ResendCodeRequest(phone_number=pending["phone"], phone_code_hash=pending["phone_code_hash"])
+            )
+        except errors.SendCodeUnavailableError:
+            die("Telegram has no other way to send a code to this number. Use login --qr from a logged-in phone")
+        except errors.PhoneCodeExpiredError:
+            PENDING.unlink(missing_ok=True)
+            die(f"that login request expired. Start again: {invocation()} login")
+        pending["phone_code_hash"] = sent.phone_code_hash
+        PENDING.write_text(json.dumps(pending))
+        PENDING.chmod(0o600)
+        report_code(sent, pending["phone"])
         return
 
     # The code and the password are two separate server-side steps. Once the
@@ -1266,7 +1443,7 @@ async def cmd_login(cli, args) -> None:
             )
         )
         PENDING.chmod(0o600)
-        print(f"code sent to {phone} (check Telegram, not SMS)")
+        report_code(sent, phone)
         print(f"then run:  {invocation()} login --code <code>")
         print("  add --password <2fa> if the account has two-step verification")
         return
@@ -1297,7 +1474,10 @@ async def cmd_login(cli, args) -> None:
             )
         await cli.sign_in(password=password)
     except errors.PhoneCodeInvalidError:
-        die("that code is wrong. Codes expire fast — request a new one with --phone")
+        die(
+            "that code is wrong. If more than one arrived, only the newest works: each request voids the older ones.\n"
+            f"Request a new one with {invocation()} login, or skip codes with login --qr"
+        )
     except errors.PhoneCodeExpiredError:
         PENDING.unlink(missing_ok=True)
         die("that code expired. Request a new one with --phone")
@@ -2290,6 +2470,99 @@ async def cmd_tags(cli, args) -> None:
 
 
 # --- the session itself: its name, and the account's other devices ----------
+
+
+async def doctor_live(name: str, timeout: float) -> dict:
+    """Connect as one account and say whether its key still logs in."""
+    set_account(name)
+    cli = client("doctor")
+    try:
+        await asyncio.wait_for(cli.connect(), timeout)
+        if not await asyncio.wait_for(cli.is_user_authorized(), timeout):
+            return {"live": "logged-out", "detail": "the key is not authorized; log in again"}
+        me = await asyncio.wait_for(cli.get_me(), timeout)
+        return {"live": "ok", "detail": label(me)}
+    except (errors.AuthKeyDuplicatedError, errors.AuthKeyUnregisteredError) as exc:
+        return {"live": "dead", "detail": f"Telegram revoked the key ({type(exc).__name__})"}
+    except (TimeoutError, OSError, ConnectionError) as exc:
+        return {"live": "unreachable", "detail": f"no answer via {route_label()} ({type(exc).__name__})"}
+    except errors.RPCError as exc:
+        return {"live": "error", "detail": str(exc)}
+    finally:
+        with contextlib.suppress(Exception):
+            await cli.disconnect()
+
+
+async def cmd_doctor(cli, args) -> None:  # opens its own clients, one per account
+    """Check every account: key alive, network route, who else uses the key, stale caches."""
+    names = [args.account] if args.account else sorted(k.stem for k in SKILL_DIR.glob("*.authkey"))
+    route = route_label()
+    # Deleted, not just counted: every client that opens a private cache sweeps
+    # them anyway, so a dry run here would report files already gone.
+    stale = sweep_caches()
+    rows = []
+    for name in names:
+        set_account(name)
+        row: dict = {"account": name, "route": route, "problems": [], "fixes": []}
+        found = session_string()
+        if not found:
+            row["key"] = "missing"
+            row["problems"].append(f"no {SESSION_STRING.name}")
+            row["fixes"].append(f"{invocation()} login --qr --open")
+        else:
+            try:
+                key = StringSession(found[0])
+                row["key"] = f"dc {key.dc_id}" if key.auth_key else "empty"
+            except ValueError, struct.error, binascii.Error:
+                row["key"] = "unreadable"
+                row["problems"].append(f"{found[1]} is not a telethon session string")
+        users = key_users(name)
+        row["users"] = [{k: u.get(k) for k in ("pid", "route", "command", "since")} for u in users]
+        routes = sorted({str(u.get("route")) for u in users} | {route})
+        if len(routes) > 1:
+            row["problems"].append(f"the key is in use via more than one route: {', '.join(routes)}")
+            row["fixes"].append("put every process for this account on one route (all direct, or all one proxy)")
+        mine = [p for p in stale if p.name.startswith(f"{SESSION.stem}-") and p.suffix == ".session"]
+        row["stale_caches"] = len(mine)
+        pending = PENDING.is_file()
+        if row["key"].startswith("dc") and len(routes) == 1 and not args.files_only:
+            row |= await doctor_live(name, args.timeout)
+            if row["live"] == "dead":
+                row["problems"].append(row["detail"])
+                row["fixes"].append(f"mv {SESSION_STRING} {SESSION_STRING}.dead && {invocation()} login --qr --open")
+            elif row["live"] == "unreachable":
+                row["problems"].append(row["detail"])
+                row["fixes"].append("check the network, or the proxy in TOPOLI_PROXY / all_proxy / https_proxy")
+            elif row["live"] != "ok":
+                row["problems"].append(row["detail"])
+        if pending and row.get("live") == "ok":
+            # A code login left over from before this key logged in: it can
+            # only confuse a later `login --code`.
+            if args.fix:
+                PENDING.unlink(missing_ok=True)
+            else:
+                row["fixes"].append("uv run topoli_user.py doctor --fix  (drops a code login nobody finished)")
+        row["pending_login"] = PENDING.is_file()
+        rows.append(row)
+
+    if emit(rows, args):
+        return
+    for row in rows:
+        mark = "✗" if row["problems"] else "✓"
+        live = f"  {row['live']}: {row['detail']}" if "live" in row else ""
+        print(f"{mark} {row['account']:<10} key {row['key']}, via {row['route']}{live}")
+        for u in row["users"]:
+            print(f"    in use by pid {u['pid']} via {u['route']} ({u['command']}, since {u['since']})")
+        if row["stale_caches"]:
+            print(f"    deleted {row['stale_caches']} caches left behind by dead processes")
+        if row["pending_login"]:
+            print("    a code login is waiting for --code (or --resend)")
+        for problem in row["problems"]:
+            print(f"    problem: {problem}")
+        for fix in row["fixes"]:
+            print(f"    fix: {fix}")
+    if not rows:
+        print("no accounts yet. Log one in with: uv run topoli_user.py [--account NAME] login --qr --open")
 
 
 async def cmd_accounts(cli, args) -> None:  # never reaches the network
@@ -3936,7 +4209,7 @@ async def cmd_watch(cli, args) -> None:
 
 #: Commands that make no sense as a tool: login is interactive by nature, and
 #: the server cannot serve itself.
-NOT_TOOLS = {"setup", "login", "mcp", "schema", "accounts", "watch"}
+NOT_TOOLS = {"setup", "login", "mcp", "schema", "accounts", "watch", "doctor"}
 
 MCP_PROTOCOLS = ("2025-06-18", "2025-03-26", "2024-11-05")
 
@@ -4416,6 +4689,11 @@ def build_parser() -> argparse.ArgumentParser:
         help="scan a QR code from a phone already logged in, instead of a code (no code is sent)",
     )
     sp.add_argument("--open", action="store_true", help="with --qr: open the QR page in the browser")
+    sp.add_argument(
+        "--resend",
+        action="store_true",
+        help="the code did not come: ask Telegram to send it the next way (SMS, call, …) when it has one",
+    )
     sp.add_argument("--qr-timeout", type=int, default=300, help="with --qr: seconds to wait for a scan (300)")
     sp.add_argument("--phone", help="phone in international form, e.g. +98XXXXXXXXXX")
     sp.add_argument("--code", help="the code Telegram sent to step one")
@@ -4575,6 +4853,14 @@ def build_parser() -> argparse.ArgumentParser:
     # --- the session ------------------------------------------------------
     sp = sub.add_parser("accounts", help="the accounts this tool can act as, one per *.authkey")
     sp.set_defaults(fn=cmd_accounts, offline=True)
+
+    sp = sub.add_parser(
+        "doctor", help="check every account: key alive, network route, other users of the key; clears stale caches"
+    )
+    sp.add_argument("--fix", action="store_true", help="also drop a code login nobody finished on a working key")
+    sp.add_argument("--offline", dest="files_only", action="store_true", help="skip connecting; check the files only")
+    sp.add_argument("--timeout", type=float, default=30, help="seconds to wait for Telegram per account (30)")
+    sp.set_defaults(fn=cmd_doctor, offline=True)
 
     sp = sub.add_parser("device", help="show or rename how this session appears in Telegram's device list")
     sp.add_argument("--name", help='the device name others see, e.g. "Claude" or "ELBoT AI"')

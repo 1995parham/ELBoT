@@ -39,11 +39,12 @@ It is built to be driven by an AI agent as much as by a person: every command is
     Without a phone at hand, log in with a code. Telegram sends it into the Telegram app of another device of the account, never by SMS to a client like this one, so with no other device logged in it never arrives. The code and the 2FA password are two separate steps, so it works without a terminal prompt:
 
     ```bash
-    uv run topoli_user.py login                       # sends the code
+    uv run topoli_user.py login                       # sends the code and says where it went
+    uv run topoli_user.py login --resend              # not there: the next way Telegram offers (SMS, call, …)
     uv run topoli_user.py login --code 12345          # add --password … if the account has 2FA
     ```
 
-    One auth key used from two IP addresses at once (say, through a proxy and directly) is revoked by Telegram for good, and every command then fails with `AuthKeyDuplicatedError`. Move the `.authkey` file aside and log in again.
+    `login` prints where Telegram says it sent the code (the app, SMS, email, a call) and whether `--resend` has another way to offer. Each new request voids the older codes, so type the newest one.
 
 3. Where Telegram is blocked, point it at a proxy: `TOPOLI_PROXY=socks5://127.0.0.1:1080` (or `http://…`). Telethon ignores the usual proxy variables, so ELBoT reads `TOPOLI_PROXY` first and falls back to `all_proxy`, `https_proxy` and `http_proxy`.
 
@@ -70,7 +71,7 @@ uv run topoli_user.py send --chat "Some Group" --quote --text "$(cat note.txt)"
 | Writing only you see | `draft`, `remind`, `tag`, `read` (`--unread`), `mute`, `archive`, `folder`, `folders`, `tags`, `alias`, `delete-contact` |
 | Presence and automation | `typing`, `watch` |
 | Groups and profile | `create-group`, `chat-photo`, `join`, `leave`, `invite`, `profile`, `privacy` |
-| The session | `accounts`, `whoami`, `device`, `sessions`, `setup`, `login` |
+| The session | `accounts`, `doctor`, `whoami`, `device`, `sessions`, `setup`, `login` |
 | AI interface | `mcp`, `schema` |
 
 ### For AI agents: MCP, JSON and dry runs
@@ -155,7 +156,19 @@ uv run topoli_user.py --account work catchup
 
 An account can carry files of its own next to the shared ones: `api-<name>.json` is merged over `api.json` (its phone, or a device name of its own with `device --this-account`), and `aliases-<name>.json` and `tags-<name>.json` *replace* the shared books for that account — the way to keep a support account that talks to clients from ever resolving a personal alias. `TOPOLI_SESSION_STRING` applies to the default account only, so an exported key can never log another account in as the wrong person.
 
-Long-running processes (`mcp`, `listen`) keep a cache of their own and lock it, so they never collide with a one-off command or with each other on "database is locked"; a second server on the same account falls back to a private cache that is deleted when it exits.
+Long-running processes (`mcp`, `listen`) keep a cache of their own and lock it, so they never collide with a one-off command or with each other on "database is locked"; a second server on the same account falls back to a private cache that is deleted when it exits. A cache left behind by a killed process is deleted by the next one that starts.
+
+### One key, one route
+
+Telegram revokes an auth key for good when it sees the key from two IP addresses at once (`AUTH_KEY_DUPLICATED`), and only a new login brings it back. Many processes on one key are fine, as long as they all leave through the same route. So every process registers the route it will use (`direct`, or the proxy) in `<state>/keys/<account>/`, and one that would add a second route refuses to connect and names the processes in its way. `TOPOLI_ALLOW_MIXED_ROUTES=1` overrides it.
+
+`doctor` checks every account in one go: whether its key still logs in, the route, who else is using the key and through what, and it clears the caches dead processes left. `doctor --offline` skips the network; `--fix` also drops a code login nobody finished.
+
+```bash
+uv run topoli_user.py doctor
+```
+
+A revoked key fails before any command runs, `login` included; the error says to move the `.authkey` aside and log in again.
 
 ### Finding the right chat
 
