@@ -255,7 +255,7 @@ def invocation() -> str:
     return base if default_account() == ACCOUNT else f"{base} --account {ACCOUNT}"
 
 
-VERSION = "0.7.0"
+VERSION = "0.7.1"
 
 #: Set while a command runs with --json, so `die` can answer in the same
 #: format: a caller parsing stdout must get an object, not an empty string.
@@ -4362,6 +4362,11 @@ async def call_tool(cli, parser: argparse.ArgumentParser, name: str, arguments: 
         return {"content": [{"type": "text", "text": str(exc)}], "isError": True}
     with contextlib.redirect_stdout(out), contextlib.redirect_stderr(err):
         try:
+            # Telethon stops reconnecting after five failed tries (a laptop
+            # asleep, the proxy down) and leaves the client disconnected for
+            # good; connect again here, so one bad night is not a dead server.
+            if cli is not None and not cli.is_connected():
+                await cli.connect()
             args = parser.parse_args(argv)
             JSON_ERRORS = bool(getattr(args, "json", False))
             await args.fn(cli, args)
@@ -4373,6 +4378,9 @@ async def call_tool(cli, parser: argparse.ArgumentParser, name: str, arguments: 
         except errors.RPCError as exc:
             failed = True
             print(f"Telegram error: {exc}", file=sys.stderr)
+        except Exception as exc:  # ConnectionError, OSError, a bug in one command: fail the call, keep serving
+            failed = True
+            print(f"{type(exc).__name__}: {exc}", file=sys.stderr)
         finally:
             JSON_ERRORS = False
     content = []
@@ -4583,6 +4591,22 @@ async def mcp_handle(cli, parser, specs: list[dict], msg: dict) -> dict | None:
     return {"jsonrpc": "2.0", "id": rid, "result": res}
 
 
+async def mcp_reply(cli, parser, specs: list[dict], msg: dict) -> dict | None:
+    """`mcp_handle`, with any exception answered as a JSON-RPC error.
+
+    An exception that escaped the loop used to end the process, and the client
+    only learned of it on the next call ("Connection closed"), with nothing on
+    stderr to say why.
+    """
+    try:
+        return await mcp_handle(cli, parser, specs, msg)
+    except Exception as exc:
+        print(f"elbot mcp [{ACCOUNT}]: {msg.get('method')} failed: {type(exc).__name__}: {exc}", file=sys.stderr)
+        if msg.get("id") is None:
+            return None
+        return {"jsonrpc": "2.0", "id": msg["id"], "error": {"code": -32603, "message": f"{type(exc).__name__}: {exc}"}}
+
+
 async def cmd_mcp(cli, args) -> None:
     """Serve every command as an MCP tool on stdin/stdout.
 
@@ -4615,7 +4639,7 @@ async def cmd_mcp(cli, args) -> None:
         except json.JSONDecodeError as exc:
             reply: dict | None = {"jsonrpc": "2.0", "id": None, "error": {"code": -32700, "message": str(exc)}}
         else:
-            reply = await mcp_handle(cli, parser, specs, msg)
+            reply = await mcp_reply(cli, parser, specs, msg)
         if reply is not None:
             wire.write(json.dumps(reply, ensure_ascii=False, default=str) + "\n")
             wire.flush()

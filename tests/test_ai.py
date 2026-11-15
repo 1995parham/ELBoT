@@ -146,6 +146,42 @@ class TestMcp:
         res = asyncio.run(t.call_tool(None, parser, "send", {"chat": "me"}))  # no text: argparse exits 2
         assert res["isError"] is True
 
+    def test_a_lost_connection_is_a_failed_call_not_a_dead_server(self, monkeypatch):
+        # Telethon gives up after five reconnects (a laptop asleep, the proxy
+        # down), and every later request raises ConnectionError, which is not
+        # an RPCError. It used to escape call_tool and end the server silently.
+        async def boom(cli, args):
+            raise ConnectionError("Cannot send requests while disconnected")
+
+        monkeypatch.setattr(t, "cmd_device", boom)
+        res = asyncio.run(t.call_tool(None, t.build_parser(), "device", {}))
+        assert res["isError"] is True
+        assert "ConnectionError" in res["content"][0]["text"]
+
+    def test_a_dropped_client_is_reconnected_before_the_call(self, parser):
+        class Dropped:
+            connects = 0
+
+            def is_connected(self):
+                return self.connects > 0
+
+            async def connect(self):
+                self.connects += 1
+
+        cli = Dropped()
+        asyncio.run(t.call_tool(cli, parser, "send", {"chat": "me"}))
+        assert cli.connects == 1
+
+    def test_a_broken_handler_is_a_json_rpc_error_not_a_dead_server(self, parser, monkeypatch):
+        async def boom(*_):
+            raise OSError("network is unreachable")
+
+        monkeypatch.setattr(t, "call_tool", boom)
+        msg = {"jsonrpc": "2.0", "id": 9, "method": "tools/call", "params": {"name": "whoami"}}
+        reply = asyncio.run(t.mcp_reply(None, parser, [], msg))
+        assert reply is not None
+        assert reply["error"]["code"] == -32603 and "network is unreachable" in reply["error"]["message"]
+
     def test_json_errors_are_switched_off_again(self, parser):
         asyncio.run(t.call_tool(None, parser, "send", {"chat": "me"}))
         assert t.JSON_ERRORS is False
