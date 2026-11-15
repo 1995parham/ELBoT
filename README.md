@@ -210,10 +210,9 @@ This repository is public and holds **code only**. Every credential lives outsid
 
 ```bash
 uv sync                    # create the environment from pyproject
-uv run ruff check .
-uv run ruff format --check .
-uv run ty check .
-uv run pytest
+just hooks                 # once per clone: run `just check` before every commit
+just check                 # what CI runs: ruff, ruff format, ty (warnings fail), pytest
+just fix                   # mend what ruff can
 ```
 
 `ruff` lints and checks formatting, `ty` type-checks, and `pytest` needs no network: it covers the code whose bugs would be silent or would reach the wrong person — message formatting (UTF-16 entity offsets, which fail silently across emoji and Persian), chat resolution and the alias book, account selection and key isolation, the MCP tool schema and the JSON-RPC round trip, prompts and resources, the watcher's rule matching, tags, durations and polls. All of it runs in CI on every push and pull request. The project targets Python 3.14, so it leans on what that release added — annotations are lazy by default (PEP 649), and `except` takes an unparenthesised list of exception types (PEP 758).

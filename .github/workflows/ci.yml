@@ -33,7 +33,7 @@ jobs:
               run: uv run ruff format --check .
 
             - name: Run ty (types)
-              run: uv run ty check .
+              run: uv run ty check . --error-on-warning
 
             - name: Run pytest
               run: uv run pytest

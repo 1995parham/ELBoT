@@ -1,0 +1,3 @@
+#!/bin/sh
+# Run what CI runs before every commit; `git commit --no-verify` skips it.
+exec just check
