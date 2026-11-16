@@ -28,11 +28,14 @@ import binascii
 import contextlib
 import fcntl
 import io
+import ipaddress
 import json
 import os
 import platform
 import random
 import re
+import socket
+import ssl
 import struct
 import sys
 from collections import Counter
@@ -255,7 +258,7 @@ def invocation() -> str:
     return base if default_account() == ACCOUNT else f"{base} --account {ACCOUNT}"
 
 
-VERSION = "0.7.1"
+VERSION = "0.8.0"
 
 #: Set while a command runs with --json, so `die` can answer in the same
 #: format: a caller parsing stdout must get an object, not an empty string.
@@ -582,6 +585,165 @@ def claim_key() -> None:
     atexit.register(path.unlink, missing_ok=True)
 
 
+# --------------------------------------------------------------------------
+# exit-address pin — a key only ever connects from the address it was pinned to
+# --------------------------------------------------------------------------
+#
+# The route guard above compares route *labels*, and a label is not an address:
+# "direct" behind a VPN that fails over, or picks its exit by latency, is one
+# label and several addresses. The keys that died on 2026-11-14 and 2026-11-16
+# died that way, with nothing on the machine changed by hand.
+#
+# So every key carries the address it connects from, in `<account>.exitip`
+# beside `<account>.authkey`. Before any connection the exit address is probed
+# over the same path Telegram will take (the proxy, if one is set, or the
+# default route), and if it differs from the pin the run stops before Telegram
+# sees anything. Only `pin-ip --accept`, run by a person, moves the pin.
+#
+# Telegram does not report the address of the session it is talking to (the
+# current authorization's `ip` comes back empty), but it does report a
+# location. That is pinned too and checked after connecting, which catches a
+# probe that took a different path from MTProto, at the resolution of a city.
+#
+# TOPOLI_IP_GUARD=off turns the whole check off, for a machine that knows better.
+
+#: Plain-text "what is my address" services, tried in order; any one is enough.
+#: All IPv4-only: Telethon reaches Telegram over IPv4, and a dual-stack service
+#: answering over IPv6 would read as an address change.
+IP_ECHOES = (("api.ipify.org", "/"), ("ipv4.icanhazip.com", "/"), ("v4.ident.me", "/"))
+
+
+def exit_ip_file() -> Path:
+    return SESSION_STRING.with_suffix(".exitip")
+
+
+def ip_guard_on() -> bool:
+    return os.environ.get("TOPOLI_IP_GUARD", "").strip().lower() not in ("off", "0", "no")
+
+
+def read_pin() -> dict | None:
+    try:
+        pin = json.loads(exit_ip_file().read_text())
+    except OSError, ValueError:
+        return None
+    return pin if isinstance(pin, dict) and pin.get("ip") else None
+
+
+def write_pin(ip: str, location: str | None = None, pinned: str | None = None) -> dict:
+    """Store the pin; `pinned` keeps the original time when only the location is filled in."""
+    pin = {"ip": ip, "location": location, "pinned": pinned or datetime.now(UTC).isoformat(timespec="seconds")}
+    tmp = exit_ip_file().with_suffix(f".exitip.{os.getpid()}.tmp")
+    tmp.write_text(json.dumps(pin) + "\n")
+    tmp.replace(exit_ip_file())
+    return pin
+
+
+def echo_once(host: str, path: str, timeout: float) -> str:
+    """Ask one echo service for our address, over the path MTProto will take."""
+    px = proxy()
+    if px:
+        from python_socks import ProxyType
+        from python_socks.sync import Proxy
+
+        kind = {"http": ProxyType.HTTP, "socks4": ProxyType.SOCKS4, "socks5": ProxyType.SOCKS5}[px[0]]
+        raw = Proxy(proxy_type=kind, host=px[1], port=px[2], rdns=True).connect(host, 443, timeout=timeout)
+    else:
+        ipv4 = str(socket.getaddrinfo(host, 443, socket.AF_INET, socket.SOCK_STREAM)[0][4][0])
+        raw = socket.create_connection((ipv4, 443), timeout=timeout)
+    raw.settimeout(timeout)
+    with ssl.create_default_context().wrap_socket(raw, server_hostname=host) as tls:
+        tls.sendall(f"GET {path} HTTP/1.1\r\nHost: {host}\r\nUser-Agent: elbot\r\nConnection: close\r\n\r\n".encode())
+        data = b""
+        # Stop at Content-Length rather than at the close: some HTTP proxies
+        # keep the tunnel open after the server has hung up.
+        while chunk := tls.recv(4096):
+            data += chunk
+            head, sep, body = data.partition(b"\r\n\r\n")
+            size = re.search(rb"(?im)^content-length:\s*(\d+)", head) if sep else None
+            if size and len(body) >= int(size.group(1)):
+                break
+    head, _, body = data.partition(b"\r\n\r\n")
+    if b" 200 " not in head.split(b"\r\n", 1)[0]:
+        raise OSError(f"{host} answered {head.split(b'\r\n', 1)[0].decode(errors='replace')}")
+    return str(ipaddress.ip_address(body.decode().strip()))
+
+
+def probe_exit_ip(timeout: float = 8.0) -> str:
+    """Our public address as the network sees it from this route, or die."""
+    failures = []
+    for host, path in IP_ECHOES:
+        try:
+            return echo_once(host, path, timeout)
+        except (OSError, ValueError) as exc:
+            failures.append(f"{host}: {type(exc).__name__} {exc}".strip())
+    die(
+        f"account {ACCOUNT!r}: could not learn the exit address via {route_label()}, so the key stays unused:\n    "
+        + "\n    ".join(failures)
+        + "\nTOPOLI_IP_GUARD=off skips the check, at the risk of Telegram revoking the key."
+    )
+
+
+def check_exit_ip() -> str | None:
+    """Probe the exit address and refuse to go on if it is not the pinned one."""
+    if not ip_guard_on():
+        return None
+    ip = probe_exit_ip()
+    pin = read_pin()
+    if pin and pin["ip"] != ip:
+        die(
+            f"account {ACCOUNT!r}: the exit address changed from {pin['ip']} "
+            f"(pinned {pin.get('pinned', '?')}) to {ip}.\n"
+            "Telegram revokes a key it sees from two addresses at once (AUTH_KEY_DUPLICATED), so nothing connected.\n"
+            "If the network moved on purpose and nothing else still uses this key from the old address, accept it:\n"
+            f"    {invocation()} pin-ip --accept"
+        )
+    return ip
+
+
+async def current_location(cli) -> str | None:
+    """Where Telegram places this session (it does not say the address)."""
+    try:
+        res = await cli(GetAuthorizationsRequest())
+    except errors.RPCError:
+        return None
+    here = next((a for a in res.authorizations if getattr(a, "current", False)), None)
+    if here is None:
+        return None
+    where = ", ".join(x for x in (getattr(here, "region", ""), getattr(here, "country", "")) if x)
+    return where or None
+
+
+async def verify_location(cli, ip: str | None) -> None:
+    """After connecting: pin on first use, else check Telegram's view of where we are."""
+    if ip is None:
+        return
+    where = await current_location(cli)
+    pin = read_pin()
+    if pin is None:
+        write_pin(ip, where)
+        print(f"pinned account {ACCOUNT!r} to exit address {ip} ({where or 'location unknown'})", file=sys.stderr)
+        return
+    if not pin.get("location") and where:
+        write_pin(pin["ip"], where, pin.get("pinned"))
+        return
+    if where and pin.get("location") and where != pin["location"]:
+        await cli.disconnect()
+        die(
+            f"account {ACCOUNT!r}: Telegram places this session in {where}, but the key is pinned to\n"
+            f"{pin['location']} ({pin['ip']}). The address probe and Telegram took different paths, so the\n"
+            "probe cannot be trusted on this route; disconnected. Route Telegram and the probe the same way,\n"
+            f"or accept the new place: {invocation()} pin-ip --accept"
+        )
+
+
+async def gated_connect(cli) -> None:
+    """Connect only from the pinned exit address; the one way this tool connects."""
+    ip = check_exit_ip()
+    await cli.connect()
+    if await cli.is_user_authorized():
+        await verify_location(cli, ip)
+
+
 def client(cache: str | None = None) -> TelegramClient:
     """A client on the shared auth key.
 
@@ -599,6 +761,10 @@ def client(cache: str | None = None) -> TelegramClient:
         api_id,
         api_hash,
         proxy=proxy(),  # ty: ignore[invalid-argument-type]
+        # Never reconnect behind our back: a reconnect after the exit address
+        # changed is exactly how one key ends up seen from two addresses.
+        # Every connect goes through gated_connect, which checks the pin first.
+        auto_reconnect=False,
         device_model=who["device_model"],
         system_version=who["system_version"],
         app_version=who["app_version"],
@@ -2477,13 +2643,15 @@ async def doctor_live(name: str, timeout: float) -> dict:
     set_account(name)
     cli = client("doctor")
     try:
-        await asyncio.wait_for(cli.connect(), timeout)
+        await asyncio.wait_for(gated_connect(cli), timeout)
         if not await asyncio.wait_for(cli.is_user_authorized(), timeout):
             return {"live": "logged-out", "detail": "the key is not authorized; log in again"}
         me = await asyncio.wait_for(cli.get_me(), timeout)
         return {"live": "ok", "detail": label(me)}
     except (errors.AuthKeyDuplicatedError, errors.AuthKeyUnregisteredError) as exc:
         return {"live": "dead", "detail": f"Telegram revoked the key ({type(exc).__name__})"}
+    except SystemExit:
+        return {"live": "ip-changed", "detail": "the exit address is not the pinned one; see `pin-ip`"}
     except (TimeoutError, OSError, ConnectionError) as exc:
         return {"live": "unreachable", "detail": f"no answer via {route_label()} ({type(exc).__name__})"}
     except errors.RPCError as exc:
@@ -2516,6 +2684,8 @@ async def cmd_doctor(cli, args) -> None:  # opens its own clients, one per accou
             except ValueError, struct.error, binascii.Error:
                 row["key"] = "unreadable"
                 row["problems"].append(f"{found[1]} is not a telethon session string")
+        pin = read_pin()
+        row["pinned_ip"] = pin and {k: pin.get(k) for k in ("ip", "location", "pinned")}
         users = key_users(name)
         row["users"] = [{k: u.get(k) for k in ("pid", "route", "command", "since")} for u in users]
         routes = sorted({str(u.get("route")) for u in users} | {route})
@@ -2530,6 +2700,9 @@ async def cmd_doctor(cli, args) -> None:  # opens its own clients, one per accou
             if row["live"] == "dead":
                 row["problems"].append(row["detail"])
                 row["fixes"].append(f"mv {SESSION_STRING} {SESSION_STRING}.dead && {invocation()} login --qr --open")
+            elif row["live"] == "ip-changed":
+                row["problems"].append(row["detail"])
+                row["fixes"].append(f"{invocation()} pin-ip  (then --accept, once nothing uses the old address)")
             elif row["live"] == "unreachable":
                 row["problems"].append(row["detail"])
                 row["fixes"].append("check the network, or the proxy in TOPOLI_PROXY / all_proxy / https_proxy")
@@ -2551,6 +2724,9 @@ async def cmd_doctor(cli, args) -> None:  # opens its own clients, one per accou
         mark = "✗" if row["problems"] else "✓"
         live = f"  {row['live']}: {row['detail']}" if "live" in row else ""
         print(f"{mark} {row['account']:<10} key {row['key']}, via {row['route']}{live}")
+        if row["pinned_ip"]:
+            p = row["pinned_ip"]
+            print(f"    pinned to {p['ip']} ({p.get('location') or 'location not seen yet'}, since {p['pinned']})")
         for u in row["users"]:
             print(f"    in use by pid {u['pid']} via {u['route']} ({u['command']}, since {u['since']})")
         if row["stale_caches"]:
@@ -3540,7 +3716,7 @@ async def cmd_listen(cli, args) -> None:
             if wait is not None and wait <= 0:
                 break
             try:
-                msg = await asyncio.wait_for(queue.get(), timeout=wait)
+                msg = await next_message(cli, queue, wait)
             except TimeoutError:
                 break
             chat = await msg.get_chat()
@@ -3554,6 +3730,28 @@ async def cmd_listen(cli, args) -> None:
     finally:
         cli.remove_event_handler(on_message, builder)
     say(args, f"-- {seen} message(s)")
+
+
+#: How often a waiting listen/watch checks that its connection is still up.
+RECONNECT_CHECK = 30.0
+
+
+async def next_message(cli, queue: asyncio.Queue, wait: float | None):
+    """The next queued message, reconnecting through the address gate if the link dropped.
+
+    Raises TimeoutError when `wait` runs out, like asyncio.wait_for.
+    """
+    loop = asyncio.get_running_loop()
+    deadline = None if wait is None else loop.time() + wait
+    while True:
+        left = None if deadline is None else deadline - loop.time()
+        if left is not None and left <= 0:
+            raise TimeoutError
+        try:
+            return await asyncio.wait_for(queue.get(), timeout=min(RECONNECT_CHECK, left or RECONNECT_CHECK))
+        except TimeoutError:
+            if not cli.is_connected():
+                await gated_connect(cli)
 
 
 def export_markdown(entity, rows: list[dict]) -> str:
@@ -4161,7 +4359,7 @@ async def cmd_watch(cli, args) -> None:
             if wait is not None and wait <= 0:
                 break
             try:
-                msg = await asyncio.wait_for(queue.get(), timeout=wait)
+                msg = await next_message(cli, queue, wait)
             except TimeoutError:
                 break
             chat = await msg.get_chat()
@@ -4207,9 +4405,10 @@ async def cmd_watch(cli, args) -> None:
 # `schema` prints the same list for anything that wants function definitions
 # instead (OpenAI-style tools, a prompt, a test).
 
-#: Commands that make no sense as a tool: login is interactive by nature, and
+#: Commands that make no sense as a tool: login is interactive by nature, pin-ip
+#: is a person's decision that an agent must never take for them, and
 #: the server cannot serve itself.
-NOT_TOOLS = {"setup", "login", "mcp", "schema", "accounts", "watch", "doctor"}
+NOT_TOOLS = {"setup", "login", "mcp", "schema", "accounts", "watch", "doctor", "pin-ip"}
 
 MCP_PROTOCOLS = ("2025-06-18", "2025-03-26", "2024-11-05")
 
@@ -4366,7 +4565,7 @@ async def call_tool(cli, parser: argparse.ArgumentParser, name: str, arguments: 
             # asleep, the proxy down) and leaves the client disconnected for
             # good; connect again here, so one bad night is not a dead server.
             if cli is not None and not cli.is_connected():
-                await cli.connect()
+                await gated_connect(cli)
             args = parser.parse_args(argv)
             JSON_ERRORS = bool(getattr(args, "json", False))
             await args.fn(cli, args)
@@ -4607,6 +4806,37 @@ async def mcp_reply(cli, parser, specs: list[dict], msg: dict) -> dict | None:
         return {"jsonrpc": "2.0", "id": msg["id"], "error": {"code": -32603, "message": f"{type(exc).__name__}: {exc}"}}
 
 
+async def cmd_pin_ip(cli, args) -> None:  # offline: it must work exactly when connecting is refused
+    """Show the exit address this account's key is pinned to, or move the pin to the current one."""
+    pin = read_pin()
+    current = probe_exit_ip()
+    others = key_users()
+    data = {"account": ACCOUNT, "pinned": pin, "current": current, "matches": bool(pin) and pin["ip"] == current}
+    data["in_use_by"] = [{k: u.get(k) for k in ("pid", "route", "command", "since")} for u in others]
+    if not args.accept:
+        if pin is None:
+            text = f"{ACCOUNT}: no pin yet; the next connection pins {current}"
+        else:
+            state = "matches" if data["matches"] else "DIFFERS"
+            where = pin.get("location") or "?"
+            text = f"{ACCOUNT}: pinned {pin['ip']} ({where}, {pin.get('pinned')}), now {current} — {state}"
+        result(args, data, text)
+        return
+    if others and not args.force:
+        who = "\n".join(f"    pid {u.get('pid')} ({u.get('command', '?')}) via {u.get('route')}" for u in others)
+        die(
+            f"account {ACCOUNT!r} is still in use by:\n{who}\n"
+            "Moving the pin while they hold connections from the old address is how keys get revoked.\n"
+            "Stop them first, or pass --force if you are sure they are gone."
+        )
+    if pin and pin["ip"] == current:
+        result(args, {**data, "changed": False}, f"{ACCOUNT}: already pinned to {current}")
+        return
+    new = write_pin(current)  # the location is filled in by the next connection
+    old = pin["ip"] if pin else "(none)"
+    result(args, {**data, "changed": True, "pinned": new}, f"{ACCOUNT}: pin moved {old} → {current}")
+
+
 async def cmd_mcp(cli, args) -> None:
     """Serve every command as an MCP tool on stdin/stdout.
 
@@ -4724,6 +4954,11 @@ def build_parser() -> argparse.ArgumentParser:
     sp.add_argument("--password", help="2FA password (or set TOPOLI_2FA_PASSWORD)")
     sp.set_defaults(fn=cmd_login)
     sub.add_parser("whoami", help="show the logged-in account").set_defaults(fn=cmd_whoami)
+
+    sp = add_json(sub.add_parser("pin-ip", help="the exit address this account's key may connect from"))
+    sp.add_argument("--accept", action="store_true", help="move the pin to the current exit address")
+    sp.add_argument("--force", action="store_true", help="with --accept: even while other processes use the key")
+    sp.set_defaults(fn=cmd_pin_ip, offline=True)
 
     sp = add_json(sub.add_parser("chats", help="list conversations with their MTProto ids"))
     sp.add_argument("--limit", type=int, default=50)
@@ -5106,12 +5341,14 @@ async def run(args) -> None:
     # calls start(), which prompts for a phone number on stdin. In a
     # non-interactive run that surfaces as an EOFError traceback instead of the
     # one-line "you are not logged in" that actually tells you what to do.
-    await cli.connect()
+    await gated_connect(cli)
     try:
         secure_session()
         if not await cli.is_user_authorized() and args.fn is not cmd_login:
             die(f"account {ACCOUNT!r} is not logged in yet. Run: {invocation()} login --phone <number>")
         await args.fn(cli, args)
+        if args.fn is cmd_login and read_pin() is None and await cli.is_user_authorized():
+            await verify_location(cli, check_exit_ip())  # a fresh key starts out pinned
     finally:
         await cli.disconnect()
 
