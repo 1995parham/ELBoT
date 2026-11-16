@@ -73,6 +73,7 @@ try:
         InviteToChannelRequest,
         JoinChannelRequest,
     )
+    from telethon.tl.functions.channels import ReadMessageContentsRequest as ChannelReadContentsRequest
     from telethon.tl.functions.contacts import DeleteContactsRequest, GetContactsRequest
 
     # Forum topics: the RPC and its parameter name both moved. It is
@@ -93,6 +94,8 @@ try:
         GetUnreadMentionsRequest,
         ImportChatInviteRequest,
         MarkDialogUnreadRequest,
+        ReadDiscussionRequest,
+        ReadMessageContentsRequest,
         SaveDraftRequest,
         SendReactionRequest,
         SendScheduledMessagesRequest,
@@ -258,7 +261,7 @@ def invocation() -> str:
     return base if default_account() == ACCOUNT else f"{base} --account {ACCOUNT}"
 
 
-VERSION = "0.8.0"
+VERSION = "0.9.0"
 
 #: Set while a command runs with --json, so `die` can answer in the same
 #: format: a caller parsing stdout must get an object, not an empty string.
@@ -905,6 +908,8 @@ def topic_row(topic) -> dict:
         "closed": bool(getattr(topic, "closed", False)),
         "pinned": bool(getattr(topic, "pinned", False)),
         "general": topic.id == GENERAL_TOPIC_ID,
+        # The newest message in the topic: what `read --topic` reads up to.
+        "last": getattr(topic, "top_message", 0) or 0,
     }
 
 
@@ -2422,13 +2427,116 @@ async def cmd_send_file(cli, args) -> None:
     result(args, {**plan, "dry_run": False, "message_ids": ids}, f"sent: message_id(s)={ids}")
 
 
+def read_scope_error(chats: list[str], unread: bool, until: int | None, topic: str | None) -> str | None:
+    """Why this combination of `read` flags cannot be honoured, or None.
+
+    --until and --topic each name a point *inside* one chat, so they need
+    exactly one --chat. --unread is a flag on the whole dialog — Telegram has
+    no "unread from message N" and no unread flag per topic — so it combines
+    with neither.
+    """
+    if until is None and topic is None:
+        return None
+    flags = " and ".join(f for f, v in (("--until", until), ("--topic", topic)) if v is not None)
+    if unread:
+        return f"--unread marks the whole dialog unread; Telegram has no per-message or per-topic unread. Drop {flags}."
+    if len(chats) != 1:
+        return f"{flags} point inside one chat — pass exactly one --chat, not {len(chats)}."
+    if until is not None and until < 1:
+        return f"--until takes a message id (from `history`), got {until}."
+    return None
+
+
+async def clear_mentions_upto(cli, entity, upto: int, top_msg_id: int | None = None) -> int:
+    """Clear the unread @mentions at or below `upto`, and only those.
+
+    `messages.readMentions` clears every mention in the chat (or topic), which
+    would swallow one that arrives after the message being acknowledged. So
+    the pending mentions are listed and the old ones marked seen one by one.
+    """
+    res = await cli(
+        GetUnreadMentionsRequest(
+            peer=entity, offset_id=0, add_offset=0, limit=100, max_id=upto + 1, min_id=0, top_msg_id=top_msg_id
+        )
+    )
+    ids = sorted(m.id for m in getattr(res, "messages", []) if m.id <= upto)
+    if not ids:
+        return 0
+    if isinstance(entity, Channel):
+        await cli(ChannelReadContentsRequest(channel=entity, id=ids))
+    else:
+        await cli(ReadMessageContentsRequest(id=ids))
+    return len(ids)
+
+
+async def unread_left(cli, entity, topic: dict | None) -> int:
+    """How many messages are still unread in the chat, or in the one topic."""
+    if topic is not None:
+        for row in await fetch_topics(cli, entity):
+            if row["id"] == topic["id"]:
+                return row["unread"]
+        return 0
+    peers = await cli(GetPeerDialogsRequest(peers=[InputDialogPeer(await cli.get_input_entity(entity))]))
+    return peers.dialogs[0].unread_count if peers.dialogs else 0
+
+
+async def read_upto(cli, args, ref: str, until: int | None, topic_ref: str | None) -> None:
+    """Mark one chat, or one topic of a forum, read up to a message.
+
+    The point is what stays unread: a message that arrived while the earlier
+    ones were being handled keeps its badge, and so does every other topic of
+    the forum. Telegram never moves the read mark backwards, so an --until
+    below it changes nothing — `unread_left` says what is actually pending.
+    """
+    entity = await resolve(cli, ref)
+    topic = await resolve_topic(cli, entity, topic_ref) if topic_ref is not None else None
+    if topic is not None:
+        upto = until if until is not None else topic["last"]
+        if not upto:
+            die(f"topic {topic['title']!r} (id={topic['id']}) reports no messages; pass --until <message id>")
+        peer = await cli.get_input_entity(entity)
+        await cli(ReadDiscussionRequest(peer=peer, msg_id=topic["id"], read_max_id=upto))
+        mentions = await clear_mentions_upto(cli, entity, upto, top_msg_id=topic["id"])
+    else:
+        assert until is not None  # read_scope_error let nothing else through
+        upto = until
+        await cli.send_read_acknowledge(entity, max_id=upto, clear_mentions=False)
+        mentions = await clear_mentions_upto(cli, entity, upto)
+    left = await unread_left(cli, entity, topic)
+    where = f"{label(entity)} ({kind(entity)}, id={entity.id})"
+    if topic is not None:
+        where += f" › topic {topic['title']} (id={topic['id']})"
+    result(
+        args,
+        {
+            "marked": "read",
+            "chats": [entity_row(entity)],
+            "topic": topic,
+            "until": upto,
+            "mentions_cleared": mentions,
+            "unread_left": left,
+        },
+        f"marked read up to message {upto}: {where} — {left} still unread",
+    )
+
+
 async def cmd_read(cli, args) -> None:
     """Mark chats read, clearing the unread badge and any pending @mention.
 
     There is no un-read. The badge is gone once this runs, and in a private chat
     the other side sees the read receipt — so it names every chat it touched
     rather than printing a count, which is what makes a mistyped id obvious.
+
+    --until and --topic narrow it to a point inside one chat, so whatever came
+    after the messages that were handled stays unread (see `read_upto`).
     """
+    until, topic_ref = getattr(args, "until", None), getattr(args, "topic", None)
+    problem = read_scope_error(args.chat, args.unread, until, topic_ref)
+    if problem:
+        die(problem)
+    if until is not None or topic_ref is not None:
+        await read_upto(cli, args, args.chat[0], until, topic_ref)
+        return
     done = []
     for ref in args.chat:
         entity = await resolve(cli, ref)
@@ -5068,9 +5176,18 @@ def build_parser() -> argparse.ArgumentParser:
     sp.add_argument("--yes", action="store_true", help="actually react (otherwise dry run)")
     sp.set_defaults(fn=cmd_react)
 
-    sp = sub.add_parser("read", help="mark chats as read (or --unread to bring the badge back)")
+    sp = add_json(sub.add_parser("read", help="mark chats as read (or --unread to bring the badge back)"))
     sp.add_argument("--chat", action="append", required=True, help="repeat for several")
     sp.add_argument("--unread", action="store_true", help="mark as unread instead; only you see this")
+    sp.add_argument(
+        "--until",
+        type=int,
+        help="read only up to and including this message id; later ones stay unread (one --chat only)",
+    )
+    sp.add_argument(
+        "--topic",
+        help='forum topic to mark read, by id, title or "general"; other topics stay unread (one --chat only)',
+    )
     sp.set_defaults(fn=cmd_read)
 
     sp = add_json(sub.add_parser("folders", help="list chat folders — Telegram's per-chat tags"))

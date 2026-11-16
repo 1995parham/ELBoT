@@ -68,7 +68,7 @@ uv run topoli_user.py send --chat "Some Group" --quote --text "$(cat note.txt)"
 | --- | --- |
 | Reading | `catchup`, `mentions`, `chats`, `contacts`, `history`, `get`, `search`, `topics`, `members`, `info`, `receipts`, `transcribe`, `download`, `export`, `listen` |
 | Writing as you (dry run until `--yes`) | `send`, `send-file`, `poll`, `edit`, `delete`, `forward`, `react`, `pin`, `scheduled` |
-| Writing only you see | `draft`, `remind`, `tag`, `read` (`--unread`), `mute`, `archive`, `folder`, `folders`, `tags`, `alias`, `delete-contact` |
+| Writing only you see | `draft`, `remind`, `tag`, `read` (`--until`, `--topic`, `--unread`), `mute`, `archive`, `folder`, `folders`, `tags`, `alias`, `delete-contact` |
 | Presence and automation | `typing`, `watch` |
 | Groups and profile | `create-group`, `chat-photo`, `join`, `leave`, `invite`, `profile`, `privacy` |
 | The session | `accounts`, `doctor`, `whoami`, `device`, `sessions`, `setup`, `login` |
@@ -183,6 +183,13 @@ An alias exists for the case the others cannot settle: "wife" is not a Telegram 
 ### Reading
 
 `catchup` is the "what did I miss" command: Telegram already tracks how many messages are unread per chat, so it reads exactly that many rather than making you guess a `--limit`. Nothing is marked read unless you pass `--read` — seeing a message and acknowledging it are different acts, and the second is visible to the other side.
+
+`read --chat X` marks a whole chat read. After handling messages, acknowledge only what was handled: `read --chat X --until N` marks read up to and including message `N`, so anything that arrived meanwhile keeps its badge, and prints how many messages are still unread. In a forum, `read --chat G --topic T` (an id, a title, or `general`, resolved as `send --topic` does) marks one topic read up to its newest message, or up to `--until N`, and leaves every other topic unread. Both name a point inside one chat, so they take exactly one `--chat`. They clear only the @mentions at or below that message, never later ones. `--unread` combines with neither, because Telegram's unread mark is a flag on the whole dialog. Telegram never moves a read mark backwards, so an `--until` below it changes nothing; the unread count in the output shows what is actually pending.
+
+```bash
+uv run topoli_user.py read --chat @alice --until 4512             # read up to message 4512 only
+uv run topoli_user.py read --chat "Pod venture" --topic "Bayat Group" --until 9031
+```
 
 `history` and `search` take a date window (`--since` / `--until`, any ISO date), and `history` additionally takes `--from-user` to follow one person through a group. `history` prints media as `[document]` / `[photo]` placeholders; `download --chat X --message N` pulls the real file onto disk.
 
