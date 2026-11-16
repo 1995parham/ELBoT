@@ -2441,7 +2441,8 @@ def read_scope_error(chats: list[str], unread: bool, until: int | None, topic: s
     if unread:
         return f"--unread marks the whole dialog unread; Telegram has no per-message or per-topic unread. Drop {flags}."
     if len(chats) != 1:
-        return f"{flags} point inside one chat — pass exactly one --chat, not {len(chats)}."
+        verb = "point" if until is not None and topic is not None else "points"
+        return f"{flags} {verb} inside one chat — pass exactly one --chat, not {len(chats)}."
     if until is not None and until < 1:
         return f"--until takes a message id (from `history`), got {until}."
     return None
